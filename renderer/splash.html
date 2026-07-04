@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Vnus Agent</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background: #050505;
+      color: #fff;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      height: 100vh;
+      overflow: hidden;
+      user-select: none;
+      -webkit-app-region: drag;
+    }
+
+    button, input { -webkit-app-region: no-drag; }
+
+    /* Stars */
+    #stars { position: fixed; inset: 0; pointer-events: none; z-index: 0; }
+    .star { position: absolute; border-radius: 50%; background: #fff; animation: twinkle var(--d) ease-in-out infinite; }
+    @keyframes twinkle { 0%,100% { opacity: 0.15; } 50% { opacity: 0.9; } }
+
+    /* Red ambient */
+    .ambient {
+      position: fixed; inset: 0; pointer-events: none; z-index: 0;
+      background: radial-gradient(ellipse 70% 50% at 50% 0%, rgba(180,20,20,0.2) 0%, transparent 70%);
+    }
+
+    .wrap {
+      position: relative; z-index: 1;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      height: 100vh; padding: 32px 28px; text-align: center;
+    }
+
+    /* ── DEMON SVG ── */
+    .demon-wrap { margin-bottom: 16px; position: relative; }
+    .demon-glow {
+      position: absolute; bottom: 4px; left: 50%; transform: translateX(-50%);
+      width: 80px; height: 16px; border-radius: 50%;
+      background: radial-gradient(ellipse, rgba(255,59,48,0.5) 0%, transparent 70%);
+      filter: blur(5px);
+      animation: glowPulse 3s ease-in-out infinite;
+    }
+    @keyframes glowPulse { 0%,100% { opacity: 0.5; } 50% { opacity: 1; } }
+
+    #demon {
+      animation: demonFloat 4.5s ease-in-out infinite;
+      filter: drop-shadow(0 0 20px rgba(200,0,0,0.3));
+    }
+    @keyframes demonFloat {
+      0%,100% { transform: translateY(0px); }
+      25% { transform: translateY(-12px) rotate(-1.5deg); }
+      75% { transform: translateY(-6px) rotate(1.5deg); }
+    }
+    @keyframes wingBeat {
+      0%,100% { transform: scaleX(1) rotate(-6deg); }
+      50% { transform: scaleX(0.8) rotate(10deg); }
+    }
+    @keyframes hornGlow {
+      0%,100% { filter: drop-shadow(0 0 4px #FF2200); }
+      50% { filter: drop-shadow(0 0 14px #FF2200) drop-shadow(0 0 28px #FF000080); }
+    }
+    @keyframes eyePulse {
+      0%,100% { filter: drop-shadow(0 0 4px #FF0000); }
+      50% { filter: drop-shadow(0 0 12px #FF0000) drop-shadow(0 0 20px #FF000070); }
+    }
+    @keyframes armSwingL {
+      0%,100% { transform: rotate(-10deg); }
+      50% { transform: rotate(18deg); }
+    }
+    @keyframes armSwingR {
+      0%,100% { transform: rotate(10deg); }
+      50% { transform: rotate(-18deg); }
+    }
+    @keyframes tailWag {
+      0%,100% { transform: rotate(-15deg); }
+      50% { transform: rotate(15deg); }
+    }
+
+    /* ── SCREENS ── */
+    .screen { display: none; flex-direction: column; align-items: center; width: 100%; }
+    .screen.active { display: flex; animation: fadeUp 0.5s ease forwards; }
+    @keyframes fadeUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+
+    /* Setup screen */
+    .setup-badge {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 5px 14px; border-radius: 20px; margin-bottom: 10px;
+      font-size: 11px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase;
+      background: rgba(255,59,48,0.12); color: #FF3B30; border: 1px solid rgba(255,59,48,0.25);
+    }
+    .setup-title { font-size: 26px; font-weight: 900; line-height: 1.1; margin-bottom: 8px; }
+    .gradient-text {
+      background: linear-gradient(135deg, #FF6B5B, #FF3B30, #CC1A10);
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+    }
+    .setup-sub { color: #666; font-size: 13px; line-height: 1.5; margin-bottom: 24px; max-width: 320px; }
+
+    /* Code display */
+    .code-label { color: #555; font-size: 11px; letter-spacing: 0.15em; text-transform: uppercase; margin-bottom: 10px; }
+    .code-box {
+      display: flex; align-items: center; gap: 8px;
+      background: rgba(255,255,255,0.04); border: 1px solid rgba(255,59,48,0.25);
+      border-radius: 14px; padding: 16px 20px; margin-bottom: 8px; width: 100%;
+      position: relative; overflow: hidden;
+    }
+    .code-box::before {
+      content: ''; position: absolute; top: 0; left: 0; right: 0; height: 1px;
+      background: linear-gradient(to right, transparent, #FF3B30, transparent);
+    }
+    .code-text {
+      flex: 1; font-family: "Courier New", monospace; font-size: 26px; font-weight: 900;
+      letter-spacing: 0.22em; color: #fff; text-align: center;
+    }
+    .code-dash { color: #444; margin: 0 -2px; }
+    .copy-btn {
+      background: none; border: none; cursor: pointer; padding: 6px;
+      border-radius: 8px; color: #555; transition: all 0.2s;
+    }
+    .copy-btn:hover { background: rgba(255,59,48,0.12); color: #FF3B30; }
+    .code-hint { color: #444; font-size: 11px; margin-bottom: 20px; }
+    .code-timer { color: #FF3B30; font-size: 11px; margin-bottom: 20px; }
+
+    /* Connected screen */
+    .connected-icon {
+      width: 56px; height: 56px; border-radius: 16px; margin-bottom: 16px;
+      background: rgba(74,222,128,0.12); border: 1px solid rgba(74,222,128,0.3);
+      display: flex; align-items: center; justify-content: center;
+    }
+    .connected-title { font-size: 22px; font-weight: 900; margin-bottom: 6px; color: #4ade80; }
+    .connected-sub { color: #666; font-size: 13px; margin-bottom: 24px; max-width: 280px; line-height: 1.5; }
+
+    /* Buttons */
+    .btn-primary {
+      display: flex; align-items: center; justify-content: center; gap-8px;
+      width: 100%; padding: 13px 20px; border-radius: 12px; border: none; cursor: pointer;
+      font-size: 14px; font-weight: 700; color: #fff;
+      background: linear-gradient(135deg, #FF3B30, #CC1A10);
+      transition: all 0.25s; gap: 8px;
+    }
+    .btn-primary:hover { transform: translateY(-1px); box-shadow: 0 8px 24px rgba(255,59,48,0.35); }
+    .btn-ghost {
+      display: flex; align-items: center; justify-content: center; gap: 8px;
+      width: 100%; padding: 12px 20px; border-radius: 12px; cursor: pointer;
+      font-size: 13px; font-weight: 600; color: #888;
+      background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08);
+      transition: all 0.25s; margin-top: 10px;
+    }
+    .btn-ghost:hover { color: #fff; border-color: rgba(255,255,255,0.15); }
+
+    /* Pulse ring for connected */
+    .pulse-ring {
+      position: absolute; border-radius: 50%;
+      border: 2px solid rgba(74,222,128,0.4);
+      animation: pulseRing 2s ease-out infinite;
+    }
+    @keyframes pulseRing {
+      0% { width: 56px; height: 56px; opacity: 1; }
+      100% { width: 100px; height: 100px; opacity: 0; }
+    }
+
+    /* Waiting dots */
+    .waiting { display: flex; align-items: center; gap: 6px; color: #555; font-size: 12px; margin-bottom: 20px; }
+    .dot { width: 5px; height: 5px; border-radius: 50%; background: #FF3B30; animation: dotBounce 1.2s ease-in-out infinite; }
+    .dot:nth-child(2) { animation-delay: 0.2s; }
+    .dot:nth-child(3) { animation-delay: 0.4s; }
+    @keyframes dotBounce { 0%,80%,100% { transform: scale(0.6); opacity: 0.4; } 40% { transform: scale(1); opacity: 1; } }
+
+    /* Close button */
+    .close-btn {
+      position: fixed; top: 14px; right: 14px;
+      width: 28px; height: 28px; border-radius: 8px; border: none;
+      background: rgba(255,255,255,0.06); color: #555; cursor: pointer;
+      display: flex; align-items: center; justify-content: center; font-size: 14px;
+      transition: all 0.2s; -webkit-app-region: no-drag;
+    }
+    .close-btn:hover { background: rgba(255,59,48,0.15); color: #FF3B30; }
+  </style>
+</head>
+<body>
+
+<div id="stars"></div>
+<div class="ambient"></div>
+
+<!-- Close button (minimize to tray) -->
+<button class="close-btn" onclick="window.vnusAgent.closeSplash()" title="Minimize to tray">✕</button>
+
+<div class="wrap">
+
+  <!-- Demon mascot -->
+  <div class="demon-wrap">
+    <svg id="demon" width="160" height="200" viewBox="0 0 200 260" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <radialGradient id="bG" cx="50%" cy="40%" r="60%">
+          <stop offset="0%" stop-color="#1a1a1a"/>
+          <stop offset="55%" stop-color="#0d0d0d"/>
+          <stop offset="85%" stop-color="#220000"/>
+          <stop offset="100%" stop-color="#550000"/>
+        </radialGradient>
+        <radialGradient id="fG" cx="50%" cy="45%" r="55%">
+          <stop offset="0%" stop-color="#222"/>
+          <stop offset="60%" stop-color="#111"/>
+          <stop offset="100%" stop-color="#330000"/>
+        </radialGradient>
+        <radialGradient id="wG" cx="30%" cy="30%" r="70%">
+          <stop offset="0%" stop-color="#1a0000"/>
+          <stop offset="100%" stop-color="#050000"/>
+        </radialGradient>
+        <radialGradient id="eG" cx="40%" cy="35%" r="60%">
+          <stop offset="0%" stop-color="#FF4400"/>
+          <stop offset="50%" stop-color="#CC0000"/>
+          <stop offset="100%" stop-color="#660000"/>
+        </radialGradient>
+        <linearGradient id="hG" x1="0%" y1="0%" x2="0%" y2="100%">
+          <stop offset="0%" stop-color="#FF2200"/>
+          <stop offset="100%" stop-color="#880000"/>
+        </linearGradient>
+      </defs>
+
+      <!-- Wings -->
+      <g style="transform-origin:80px 125px;animation:wingBeat 2.6s ease-in-out infinite">
+        <path d="M80 125 C52 105,18 90,10 64 C7 48,24 44,44 55 C30 70,34 86,54 96 C38 76,40 55,63 63 C54 80,63 102,80 114Z" fill="url(#wG)"/>
+        <path d="M80 125 C52 105,18 90,10 64 C7 48,24 44,44 55" stroke="#CC0000" stroke-width="1.2" fill="none" opacity="0.5"/>
+      </g>
+      <g style="transform-origin:120px 125px;animation:wingBeat 2.6s ease-in-out infinite reverse">
+        <path d="M120 125 C148 105,182 90,190 64 C193 48,176 44,156 55 C170 70,166 86,146 96 C162 76,160 55,137 63 C146 80,137 102,120 114Z" fill="url(#wG)"/>
+        <path d="M120 125 C148 105,182 90,190 64 C193 48,176 44,156 55" stroke="#CC0000" stroke-width="1.2" fill="none" opacity="0.5"/>
+      </g>
+
+      <!-- Horns -->
+      <g style="animation:hornGlow 2s ease-in-out infinite">
+        <path d="M76 56 C68 42,60 26,64 12 C68 24,72 40,78 52Z" fill="url(#hG)"/>
+        <path d="M124 56 C132 42,140 26,136 12 C132 24,128 40,122 52Z" fill="url(#hG)"/>
+        <path d="M87 58 C83 47,80 36,84 26 C86 36,88 48,91 56Z" fill="#AA1100"/>
+        <path d="M113 58 C117 47,120 36,116 26 C114 36,112 48,109 56Z" fill="#AA1100"/>
+      </g>
+
+      <!-- Body -->
+      <ellipse cx="100" cy="142" rx="57" ry="62" fill="#440000" opacity="0.8"/>
+      <ellipse cx="100" cy="140" rx="54" ry="59" fill="url(#bG)"/>
+      <ellipse cx="100" cy="152" rx="30" ry="34" fill="#2a0000" opacity="0.5"/>
+      <ellipse cx="100" cy="140" rx="54" ry="59" fill="none" stroke="#660000" stroke-width="2" opacity="0.5"/>
+
+      <!-- Face -->
+      <ellipse cx="100" cy="117" rx="44" ry="40" fill="#330000" opacity="0.7"/>
+      <ellipse cx="100" cy="116" rx="42" ry="38" fill="url(#fG)"/>
+
+      <!-- Brows -->
+      <path d="M68 100 C78 92,88 96,100 94 C112 96,122 92,132 100" stroke="#000" stroke-width="6" fill="none" stroke-linecap="round" opacity="0.9"/>
+      <path d="M70 103 C78 97,88 100,96 103" stroke="#CC0000" stroke-width="3.5" fill="none" stroke-linecap="round"/>
+      <path d="M130 103 C122 97,112 100,104 103" stroke="#CC0000" stroke-width="3.5" fill="none" stroke-linecap="round"/>
+
+      <!-- Eyes -->
+      <g style="animation:eyePulse 1.8s ease-in-out infinite">
+        <ellipse cx="83" cy="116" rx="15" ry="13" fill="#000" opacity="0.8"/>
+        <ellipse cx="117" cy="116" rx="15" ry="13" fill="#000" opacity="0.8"/>
+        <ellipse cx="83" cy="116" rx="13" ry="11" fill="#0a0000"/>
+        <ellipse id="le" cx="83" cy="116" rx="10" ry="8" fill="url(#eG)"/>
+        <ellipse cx="83" cy="116" rx="3" ry="7" fill="#000"/>
+        <ellipse cx="80" cy="113" rx="1.5" ry="1" fill="#FF6644" opacity="0.8"/>
+        <ellipse cx="117" cy="116" rx="13" ry="11" fill="#0a0000"/>
+        <ellipse id="re" cx="117" cy="116" rx="10" ry="8" fill="url(#eG)"/>
+        <ellipse cx="117" cy="116" rx="3" ry="7" fill="#000"/>
+        <ellipse cx="114" cy="113" rx="1.5" ry="1" fill="#FF6644" opacity="0.8"/>
+        <ellipse cx="83" cy="116" rx="13" ry="11" fill="none" stroke="#CC0000" stroke-width="1" opacity="0.6"/>
+        <ellipse cx="117" cy="116" rx="13" ry="11" fill="none" stroke="#CC0000" stroke-width="1" opacity="0.6"/>
+      </g>
+
+      <!-- Mouth + Fangs -->
+      <path d="M80 140 C88 148,112 148,120 140" fill="#110000"/>
+      <path d="M82 141 L79 152 L85 141Z" fill="#DDD"/>
+      <path d="M95 141 L92 156 L98 141Z" fill="#EEE"/>
+      <path d="M105 141 L102 156 L108 141Z" fill="#EEE"/>
+      <path d="M118 141 L115 152 L121 141Z" fill="#DDD"/>
+
+      <!-- Arms -->
+      <g style="transform-origin:54px 158px;animation:armSwingL 2.4s ease-in-out infinite">
+        <ellipse cx="54" cy="158" rx="14" ry="10" fill="url(#bG)" stroke="#440000" stroke-width="1" transform="rotate(-30 54 158)"/>
+        <ellipse cx="42" cy="172" rx="11" ry="8" fill="url(#bG)" stroke="#440000" stroke-width="1" transform="rotate(-15 42 172)"/>
+        <path d="M36 178 L28 182 M36 178 L32 188 M36 178 L40 186" stroke="#DD1100" stroke-width="2.5" stroke-linecap="round"/>
+      </g>
+      <g style="transform-origin:146px 158px;animation:armSwingR 2.4s ease-in-out infinite 0.1s">
+        <ellipse cx="146" cy="158" rx="14" ry="10" fill="url(#bG)" stroke="#440000" stroke-width="1" transform="rotate(30 146 158)"/>
+        <ellipse cx="158" cy="172" rx="11" ry="8" fill="url(#bG)" stroke="#440000" stroke-width="1" transform="rotate(15 158 172)"/>
+        <path d="M164 178 L172 182 M164 178 L168 188 M164 178 L160 186" stroke="#DD1100" stroke-width="2.5" stroke-linecap="round"/>
+      </g>
+
+      <!-- Legs -->
+      <ellipse cx="82" cy="198" rx="18" ry="10" fill="#1a0000" stroke="#440000" stroke-width="1"/>
+      <ellipse cx="118" cy="198" rx="18" ry="10" fill="#1a0000" stroke="#440000" stroke-width="1"/>
+
+      <!-- Tail -->
+      <g style="transform-origin:100px 194px;animation:tailWag 2.8s ease-in-out infinite">
+        <path d="M100 194 C106 202,116 208,120 220 C124 232,116 240,110 236 C116 232,118 224,112 219 C106 214,96 212,94 220 C92 228,100 235,106 231" stroke="#1a0000" stroke-width="7" fill="none" stroke-linecap="round"/>
+        <path d="M100 194 C106 202,116 208,120 220 C124 232,116 240,110 236 C116 232,118 224,112 219 C106 214,96 212,94 220 C92 228,100 235,106 231" stroke="#550000" stroke-width="3.5" fill="none" stroke-linecap="round"/>
+        <path d="M106 231 C102 237,96 241,100 247 C104 253,112 249,110 243 C114 247,120 243,116 238Z" fill="#CC0000"/>
+      </g>
+    </svg>
+    <div class="demon-glow"></div>
+  </div>
+
+  <!-- SCREEN 1: Setup Complete -->
+  <div class="screen active" id="screen-setup">
+    <div class="setup-badge">
+      <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+        <polyline points="20 6 9 17 4 12"/>
+      </svg>
+      Agent Ready
+    </div>
+
+    <h1 class="setup-title">
+      Your Agent is<br>
+      <span class="gradient-text">Successfully Set Up!</span>
+    </h1>
+
+    <p class="setup-sub" id="setup-sub">
+      Vnus Agent is now running on your PC. Enter the code below in your dashboard to connect.
+    </p>
+
+    <p class="code-label">Your unique connection code</p>
+
+    <div class="code-box">
+      <div class="code-text" id="code-display">
+        <span id="code-part1">·····</span>
+        <span class="code-dash"> – </span>
+        <span id="code-part2">·····</span>
+      </div>
+      <button class="copy-btn" onclick="copyCode()" title="Copy code">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+          <rect x="9" y="9" width="13" height="13" rx="2"/>
+          <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>
+        </svg>
+      </button>
+    </div>
+
+    <p class="code-timer" id="code-timer">Code expires in 10:00</p>
+    <p class="code-hint">Enter this code in Vnus Dashboard → Add Workspace</p>
+
+    <div class="waiting">
+      <div class="dot"></div>
+      <div class="dot"></div>
+      <div class="dot"></div>
+      <span>Waiting for dashboard connection...</span>
+    </div>
+
+    <button class="btn-primary" onclick="window.vnusAgent.openDashboard()">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+        <path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/>
+        <polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>
+      </svg>
+      Open Dashboard
+    </button>
+
+    <button class="btn-ghost" onclick="window.vnusAgent.closeSplash()">
+      Minimize to System Tray
+    </button>
+  </div>
+
+  <!-- SCREEN 2: Connected! -->
+  <div class="screen" id="screen-connected">
+    <div style="position:relative;display:flex;align-items:center;justify-content:center;margin-bottom:20px;">
+      <div class="pulse-ring" style="position:absolute;"></div>
+      <div class="connected-icon">
+        <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#4ade80" stroke-width="2.5" stroke-linecap="round">
+          <path d="M22 11.08V12a10 10 0 11-5.93-9.14"/>
+          <polyline points="22 4 12 14.01 9 11.01"/>
+        </svg>
+      </div>
+    </div>
+
+    <h2 class="connected-title">Workspace Connected!</h2>
+    <p class="connected-sub">
+      Your PC is now linked to your Vnus dashboard. You can now control this PC from anywhere.
+    </p>
+
+    <button class="btn-primary" onclick="window.vnusAgent.openDashboard()">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+        <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/>
+        <rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/>
+      </svg>
+      Go to Dashboard
+    </button>
+    <button class="btn-ghost" onclick="window.vnusAgent.closeSplash()">
+      Keep Running in Tray
+    </button>
+  </div>
+
+</div>
+
+<script>
+  let agentCode = "";
+  let timerInterval = null;
+
+  // Generate stars
+  const starsEl = document.getElementById("stars");
+  for (let i = 0; i < 80; i++) {
+    const s = document.createElement("div");
+    s.className = "star";
+    const size = Math.random() * 1.5 + 0.4;
+    s.style.cssText = `width:${size}px;height:${size}px;top:${Math.random()*100}%;left:${Math.random()*100}%;opacity:${Math.random()*0.5+0.1};--d:${3+Math.random()*4}s;animation-delay:${Math.random()*4}s`;
+    starsEl.appendChild(s);
+  }
+
+  // Eye colour animation
+  let ph = 0;
+  setInterval(() => {
+    ph += 0.04;
+    const i = 0.5 + 0.5 * Math.sin(ph);
+    const r = Math.round(180 + 75 * i);
+    const g = Math.round(i * 30);
+    const c = `rgb(${r},${g},0)`;
+    document.getElementById("le")?.setAttribute("fill", c);
+    document.getElementById("re")?.setAttribute("fill", c);
+  }, 40);
+
+  // Receive agent data from main process
+  window.vnusAgent.onAgentData((data) => {
+    agentCode = data.code || "";
+    const p1 = agentCode.slice(0, 5);
+    const p2 = agentCode.slice(5);
+    document.getElementById("code-part1").textContent = p1;
+    document.getElementById("code-part2").textContent = p2;
+
+    if (data.pcName) {
+      document.getElementById("setup-sub").textContent =
+        `Vnus Agent is running on ${data.pcName}. Enter the code below in your dashboard to connect.`;
+    }
+
+    // Start 10-min countdown
+    startTimer(10 * 60);
+  });
+
+  // Workspace connected
+  window.vnusAgent.onWorkspaceConnected(() => {
+    clearInterval(timerInterval);
+    document.getElementById("screen-setup").classList.remove("active");
+    document.getElementById("screen-connected").classList.add("active");
+  });
+
+  // Code refreshed
+  window.vnusAgent.onCodeRefreshed((newCode) => {
+    agentCode = newCode;
+    document.getElementById("code-part1").textContent = newCode.slice(0, 5);
+    document.getElementById("code-part2").textContent = newCode.slice(5);
+    startTimer(10 * 60);
+  });
+
+  function startTimer(seconds) {
+    clearInterval(timerInterval);
+    let remaining = seconds;
+    const el = document.getElementById("code-timer");
+    const update = () => {
+      const m = Math.floor(remaining / 60);
+      const s = remaining % 60;
+      el.textContent = `Code expires in ${m}:${s.toString().padStart(2, "0")}`;
+      if (remaining <= 0) {
+        clearInterval(timerInterval);
+        el.textContent = "Code expired — refreshing...";
+        setTimeout(() => window.vnusAgent.refreshCode(), 1000);
+      }
+      remaining--;
+    };
+    update();
+    timerInterval = setInterval(update, 1000);
+  }
+
+  function copyCode() {
+    if (!agentCode) return;
+    navigator.clipboard.writeText(agentCode).then(() => {
+      const btn = document.querySelector(".copy-btn");
+      btn.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#4ade80" stroke-width="2.5" stroke-linecap="round"><polyline points="20 6 9 17 4 12"/></svg>`;
+      setTimeout(() => {
+        btn.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>`;
+      }, 2000);
+    });
+  }
+</script>
+</body>
+</html>
