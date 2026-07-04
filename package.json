@@ -26,19 +26,16 @@
     "appId": "ai.vnus.agent",
     "productName": "Vnus Agent",
     "copyright": "Copyright © 2026 Vnus AI",
-    "icon": "assets/icon",
+    "icon": "assets/icon.png",
     "win": {
       "target": [{ "target": "nsis", "arch": ["x64"] }],
-      "icon": "assets/icon.ico",
+      "icon": "assets/icon.png",
       "requestedExecutionLevel": "requireAdministrator"
     },
     "mac": {
       "target": [{ "target": "dmg", "arch": ["x64", "arm64"] }],
-      "icon": "assets/icon.icns",
-      "category": "public.app-category.productivity",
-      "entitlements": "build/entitlements.mac.plist",
-      "entitlementsInherit": "build/entitlements.mac.plist",
-      "hardenedRuntime": true
+      "icon": "assets/icon.png",
+      "category": "public.app-category.productivity"
     },
     "linux": {
       "target": ["AppImage"],
@@ -51,8 +48,6 @@
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "shortcutName": "Vnus Agent",
-      "installerIcon": "assets/icon.ico",
-      "installerHeaderIcon": "assets/icon.ico",
       "include": "build/installer.nsh"
     },
     "extraResources": [
