@@ -33,14 +33,26 @@
       "requestedExecutionLevel": "requireAdministrator"
     },
     "mac": {
-      "target": [{ "target": "dmg", "arch": ["x64", "arm64"] }],
+      "target": [
+        { "target": "dmg", "arch": ["x64", "arm64"] }
+      ],
       "icon": "assets/icon.png",
-      "category": "public.app-category.productivity"
+      "category": "public.app-category.productivity",
+      "darkModeSupport": true,
+      "gatekeeperAssess": false
     },
     "linux": {
-      "target": ["AppImage"],
+      "target": [
+        { "target": "AppImage", "arch": ["x64"] },
+        { "target": "deb", "arch": ["x64"] }
+      ],
       "icon": "assets/icon.png",
-      "category": "Utility"
+      "category": "Utility",
+      "desktop": {
+        "StartupNotify": "false",
+        "Encoding": "UTF-8",
+        "MimeType": "x-scheme-handler/vnus"
+      }
     },
     "nsis": {
       "oneClick": false,
@@ -49,6 +61,15 @@
       "createStartMenuShortcut": true,
       "shortcutName": "Vnus Agent",
       "include": "build/installer.nsh"
+    },
+    "dmg": {
+      "title": "Vnus Agent",
+      "backgroundColor": "#050505",
+      "window": { "width": 540, "height": 380 },
+      "contents": [
+        { "x": 130, "y": 220, "type": "file" },
+        { "x": 410, "y": 220, "type": "link", "path": "/Applications" }
+      ]
     },
     "extraResources": [
       { "from": "assets/", "to": "assets/", "filter": ["**/*"] }
