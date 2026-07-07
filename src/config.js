@@ -1,5 +1,5 @@
-// Firebase config — same project as your Next.js website
-// Fill these with your Firebase project values
+// Vnus Agent Config
+// Fill these with your actual values
 
 const firebaseConfig = {
   apiKey: "AIzaSyB6xQxFjiMM-jcYMjAMBQhDKM3HktswsNE",
@@ -10,4 +10,12 @@ const firebaseConfig = {
   appId: "1:937214148740:web:d405a06c3ffd887ef482d1",
 };
 
-module.exports = { firebaseConfig };
+// Aerolink API key — get from aerolink.lat/dashboard
+// Format: aero_live_...
+const aerolinkConfig = {
+  apiKey: "aero_live_RX7IPtsP5uvLwYkks9fV_JvUKLoELPn2gdT9yvYXEXc",
+  baseUrl: "https://capi.aerolink.lat",
+  model: "claude-sonnet-4-6",
+};
+
+module.exports = { firebaseConfig, aerolinkConfig };
