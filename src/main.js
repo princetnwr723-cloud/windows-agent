@@ -5,6 +5,8 @@ const fs = require("fs");
 const { execSync, exec } = require("child_process");
 
 const { firebaseConfig } = require("./config");
+const { startCommandListener } = require("./agent/listener");
+const { aerolinkConfig } = require("./config");
 
 // ─── App Config ───────────────────────────────────────────
 const IS_DEV = process.argv.includes("--dev");
@@ -418,6 +420,8 @@ app.whenReady().then(async () => {
       state.userId = userId;
       saveState(state);
       if (splashWindow) splashWindow.webContents.send("workspace-connected", { userId });
+      // Start listening for commands now that we are connected
+      startCommandListener(state.agentCode, firebaseConfig);
     });
 
   } else {
@@ -443,6 +447,8 @@ app.whenReady().then(async () => {
       saveState(state);
       updateMenu(true);
       if (splashWindow) splashWindow.webContents.send("workspace-connected", { userId });
+      // Start listening for commands now that we are connected
+      startCommandListener(state.agentCode, firebaseConfig);
     });
   } else if (state.userId) {
     updateMenu(true);
