@@ -28,10 +28,10 @@
   "build": {
     "appId": "ai.vnus.agent",
     "productName": "Vnus Agent",
-    "copyright": "Copyright © 2026 Vnus AI",
+    "copyright": "Copyright 2026 Vnus AI",
     "icon": "assets/icon.png",
     "win": {
-      "target": [{ "target": "nsis", "arch": ["x64"] }],
+      "target": [{ "target": "nsis", "arch": ["x64", "ia32"] }],
       "icon": "assets/icon.png",
       "requestedExecutionLevel": "requireAdministrator"
     },
@@ -42,7 +42,8 @@
       "icon": "assets/icon.png",
       "category": "public.app-category.productivity",
       "darkModeSupport": true,
-      "gatekeeperAssess": false
+      "gatekeeperAssess": false,
+      "minimumSystemVersion": "10.13.0"
     },
     "linux": {
       "target": [
@@ -57,7 +58,8 @@
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "shortcutName": "Vnus Agent",
-      "include": "build/installer.nsh"
+      "include": "build/installer.nsh",
+      "warningsAsErrors": false
     },
     "dmg": {
       "title": "Vnus Agent",
