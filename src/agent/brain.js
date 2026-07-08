@@ -1,80 +1,77 @@
 // src/agent/brain.js
-// Vnus Agent Brain — Aerolink API (Anthropic-compatible proxy)
-// Base URL: https://capi.aerolink.lat
-// Key format: aero_live_...
+// Vnus Agent Brain — Aerolink API + Prompt Caching + Screenshot
 
 const { execSync } = require("child_process");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
+const { aerolinkConfig } = require("../config");
 
-// ── Config ────────────────────────────────────────────────
-const AEROLINK_BASE_URL = "https://capi.aerolink.lat";
-const AEROLINK_API_KEY = aerolinkConfig.apiKey;
-const MODEL = "claude-sonnet-4-6"; // Fast + cheap for testing
+const BASE_URL = aerolinkConfig.baseUrl;
+const API_KEY  = aerolinkConfig.apiKey;
+const MODEL    = aerolinkConfig.model;
 
-// ── Screenshot ────────────────────────────────────────────
-async function takeScreenshot() {
-  const tmpPath = path.join(os.tmpdir(), `vnus-screenshot-${Date.now()}.png`);
-
-  try {
-    if (os.platform() === "win32") {
-      // Windows — PowerShell screenshot
-      const ps = `
-        Add-Type -AssemblyName System.Windows.Forms;
-        $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds;
-        $bitmap = New-Object System.Drawing.Bitmap($screen.Width, $screen.Height);
-        $graphics = [System.Drawing.Graphics]::FromImage($bitmap);
-        $graphics.CopyFromScreen($screen.Location, [System.Drawing.Point]::Empty, $screen.Size);
-        $bitmap.Save('${tmpPath.replace(/\\/g, "\\\\")}');
-        $graphics.Dispose(); $bitmap.Dispose();
-      `;
-      execSync(`powershell -Command "${ps.replace(/\n/g, " ")}"`);
-    } else if (os.platform() === "darwin") {
-      // Mac
-      execSync(`screencapture -x "${tmpPath}"`);
-    } else {
-      // Linux
-      execSync(`scrot "${tmpPath}"`);
-    }
-
-    const imageData = fs.readFileSync(tmpPath);
-    const base64 = imageData.toString("base64");
-    fs.unlinkSync(tmpPath); // cleanup
-    return base64;
-  } catch (err) {
-    console.error("Screenshot error:", err);
-    return null;
-  }
-}
-
-// ── Call Aerolink API ─────────────────────────────────────
-async function callAerolink(command, screenshotBase64) {
-  const messages = [];
-
-  // System prompt — tells AI what it can do
-  const systemPrompt = `You are Vnus, an AI agent running on the user's PC.
-You can control the PC by responding with JSON actions.
+// ── System prompt (cached — never changes) ────────────────
+const SYSTEM_PROMPT = `You are Vnus, an AI agent running on the user's PC.
+You can control the PC by responding with a JSON array of actions.
 
 Available actions:
 - { "action": "click", "x": number, "y": number }
 - { "action": "type", "text": "string" }
-- { "action": "key", "key": "Enter|Tab|Escape|..." }
-- { "action": "open", "app": "chrome|notepad|explorer|..." }
+- { "action": "key", "key": "Enter|Tab|Escape|Backspace|..." }
+- { "action": "open", "app": "chrome|firefox|notepad|explorer|terminal|vscode" }
+- { "action": "scroll", "x": number, "y": number, "direction": "up|down", "amount": number }
+- { "action": "wait", "ms": number }
 - { "action": "screenshot" }
-- { "action": "done", "message": "Task complete message" }
-- { "action": "error", "message": "Error message" }
+- { "action": "done", "message": "Task complete description" }
+- { "action": "error", "message": "Cannot complete because..." }
 
-Always respond with a JSON array of actions. Example:
+Rules:
+1. Always look at the screenshot carefully before deciding actions
+2. Be precise with x,y coordinates when clicking
+3. Chain multiple actions to complete complex tasks
+4. Always end with "done" or "error"
+5. Respond ONLY with a valid JSON array — no explanation text
+
+Example response:
 [
   { "action": "open", "app": "chrome" },
+  { "action": "wait", "ms": 1500 },
   { "action": "done", "message": "Chrome opened successfully" }
-]
+]`;
 
-Look at the screenshot carefully before deciding what to do.
-Be precise with coordinates when clicking.`;
+// ── Screenshot ────────────────────────────────────────────
+async function takeScreenshot() {
+  const tmpPath = path.join(os.tmpdir(), `vnus-ss-${Date.now()}.png`);
+  try {
+    if (os.platform() === "win32") {
+      const ps = `
+        Add-Type -AssemblyName System.Windows.Forms;
+        $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds;
+        $bitmap = New-Object System.Drawing.Bitmap($screen.Width, $screen.Height);
+        $g = [System.Drawing.Graphics]::FromImage($bitmap);
+        $g.CopyFromScreen($screen.Location, [System.Drawing.Point]::Empty, $screen.Size);
+        $bitmap.Save('${tmpPath.replace(/\\/g, "\\\\")}');
+        $g.Dispose(); $bitmap.Dispose();
+      `.replace(/\n/g, " ");
+      execSync(`powershell -Command "${ps}"`);
+    } else if (os.platform() === "darwin") {
+      execSync(`screencapture -x "${tmpPath}"`);
+    } else {
+      execSync(`scrot "${tmpPath}"`);
+    }
+    const base64 = fs.readFileSync(tmpPath).toString("base64");
+    fs.unlinkSync(tmpPath);
+    return base64;
+  } catch (err) {
+    console.error("Screenshot error:", err.message);
+    return null;
+  }
+}
 
-  // Build message with screenshot if available
+// ── Call Aerolink API with prompt caching ─────────────────
+async function callAerolink(command, screenshotBase64) {
+  // User message content
   const userContent = screenshotBase64
     ? [
         {
@@ -87,7 +84,7 @@ Be precise with coordinates when clicking.`;
         },
         {
           type: "text",
-          text: `Current screen shown above. User command: "${command}"\n\nRespond with JSON actions array only.`,
+          text: `Current screen shown above.\nUser command: "${command}"\n\nRespond with JSON actions array only.`,
         },
       ]
     : [
@@ -97,199 +94,207 @@ Be precise with coordinates when clicking.`;
         },
       ];
 
-  messages.push({ role: "user", content: userContent });
+  const body = {
+    model: MODEL,
+    max_tokens: 1024,
+    // Prompt caching — system prompt cached for 5 minutes
+    // Saves tokens + faster response on repeated calls
+    system: [
+      {
+        type: "text",
+        text: SYSTEM_PROMPT,
+        cache_control: { type: "ephemeral" }, // Cache this!
+      },
+    ],
+    messages: [{ role: "user", content: userContent }],
+  };
 
   try {
-    const response = await fetch(`${AEROLINK_BASE_URL}/v1/messages`, {
+    const response = await fetch(`${BASE_URL}/v1/messages`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "x-api-key": AEROLINK_API_KEY,
+        "x-api-key": API_KEY,
         "anthropic-version": "2023-06-01",
+        "anthropic-beta": "prompt-caching-2024-07-31", // Enable caching
       },
-      body: JSON.stringify({
-        model: MODEL,
-        max_tokens: 1024,
-        system: systemPrompt,
-        messages,
-      }),
+      body: JSON.stringify(body),
     });
 
     if (!response.ok) {
       const err = await response.text();
-      console.error("Aerolink error:", err);
+      console.error("Aerolink API error:", err);
       return null;
     }
 
     const data = await response.json();
+
+    // Log cache stats
+    if (data.usage) {
+      console.log("Tokens used:", {
+        input: data.usage.input_tokens,
+        output: data.usage.output_tokens,
+        cache_read: data.usage.cache_read_input_tokens || 0,
+        cache_created: data.usage.cache_creation_input_tokens || 0,
+      });
+    }
+
     const text = data.content?.[0]?.text || "";
 
-    // Parse JSON actions from response
-    const jsonMatch = text.match(/\[[\s\S]*\]/);
-    if (jsonMatch) {
-      return JSON.parse(jsonMatch[0]);
-    }
+    // Parse JSON actions
+    const match = text.match(/\[[\s\S]*\]/);
+    if (match) return JSON.parse(match[0]);
     return null;
   } catch (err) {
-    console.error("API call error:", err);
+    console.error("API call error:", err.message);
     return null;
   }
 }
 
-// ── Execute Actions ───────────────────────────────────────
+// ── Execute actions ───────────────────────────────────────
 async function executeActions(actions) {
   const results = [];
 
   for (const action of actions) {
-    console.log("Executing:", action);
-
+    console.log("Action:", JSON.stringify(action));
     try {
-      if (action.action === "open") {
-        await openApp(action.app);
-        results.push({ success: true, action });
-      } else if (action.action === "click") {
-        await mouseClick(action.x, action.y);
-        results.push({ success: true, action });
-      } else if (action.action === "type") {
-        await typeText(action.text);
-        results.push({ success: true, action });
-      } else if (action.action === "key") {
-        await pressKey(action.key);
-        results.push({ success: true, action });
-      } else if (action.action === "screenshot") {
-        const ss = await takeScreenshot();
-        results.push({ success: true, action, screenshot: ss });
-      } else if (action.action === "done") {
-        results.push({ success: true, action, done: true, message: action.message });
-        break;
-      } else if (action.action === "error") {
-        results.push({ success: false, action, message: action.message });
-        break;
-      }
+      if (action.action === "open")       await openApp(action.app);
+      else if (action.action === "click") await mouseClick(action.x, action.y);
+      else if (action.action === "type")  await typeText(action.text);
+      else if (action.action === "key")   await pressKey(action.key);
+      else if (action.action === "wait")  await new Promise(r => setTimeout(r, action.ms || 500));
+      else if (action.action === "scroll") await scrollPage(action.x, action.y, action.direction, action.amount);
 
-      // Small delay between actions
-      await new Promise((r) => setTimeout(r, 500));
+      results.push({ success: true, action });
+
+      if (action.action === "done" || action.action === "error") break;
+
+      // Delay between actions
+      await new Promise(r => setTimeout(r, 400));
     } catch (err) {
+      console.error("Action error:", err.message);
       results.push({ success: false, action, error: err.message });
     }
   }
-
   return results;
 }
 
 // ── Open App ─────────────────────────────────────────────
 async function openApp(appName) {
-  const platform = os.platform();
-  const apps = {
-    chrome:   { win32: "start chrome", darwin: "open -a 'Google Chrome'", linux: "google-chrome" },
-    firefox:  { win32: "start firefox", darwin: "open -a Firefox", linux: "firefox" },
-    notepad:  { win32: "start notepad", darwin: "open -a TextEdit", linux: "gedit" },
-    explorer: { win32: "start explorer", darwin: "open ~", linux: "nautilus ~" },
-    terminal: { win32: "start cmd", darwin: "open -a Terminal", linux: "x-terminal-emulator" },
-    vscode:   { win32: "start code", darwin: "open -a 'Visual Studio Code'", linux: "code" },
+  const p = os.platform();
+  const map = {
+    chrome:   { win32: "start chrome",       darwin: "open -a 'Google Chrome'", linux: "google-chrome &" },
+    firefox:  { win32: "start firefox",      darwin: "open -a Firefox",         linux: "firefox &" },
+    notepad:  { win32: "start notepad",      darwin: "open -a TextEdit",        linux: "gedit &" },
+    explorer: { win32: "start explorer",     darwin: "open ~",                  linux: "nautilus ~ &" },
+    terminal: { win32: "start cmd",          darwin: "open -a Terminal",        linux: "x-terminal-emulator &" },
+    vscode:   { win32: "start code",         darwin: "open -a 'Visual Studio Code'", linux: "code &" },
   };
-
-  const cmd = apps[appName.toLowerCase()]?.[platform];
-  if (cmd) {
-    execSync(cmd, { shell: true });
-  } else {
-    // Try to open directly
-    if (platform === "win32") execSync(`start ${appName}`, { shell: true });
-    else if (platform === "darwin") execSync(`open -a "${appName}"`, { shell: true });
-    else execSync(appName, { shell: true });
-  }
+  const cmd = map[appName.toLowerCase()]?.[p];
+  execSync(cmd || (p === "win32" ? `start ${appName}` : p === "darwin" ? `open -a "${appName}"` : `${appName} &`), { shell: true });
 }
 
-// ── Mouse Click ──────────────────────────────────────────
+// ── Mouse click ──────────────────────────────────────────
 async function mouseClick(x, y) {
-  const platform = os.platform();
-
-  if (platform === "win32") {
+  const p = os.platform();
+  if (p === "win32") {
     const ps = `
       Add-Type -AssemblyName System.Windows.Forms;
-      [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point(${x}, ${y});
-      $signature = '[DllImport("user32.dll")]public static extern void mouse_event(int flags, int dx, int dy, int buttons, int extraInfo);';
-      $t = Add-Type -MemberDefinition $signature -Name User32 -Namespace Win32 -PassThru;
-      $t::mouse_event(0x0002, 0, 0, 0, 0);
-      $t::mouse_event(0x0004, 0, 0, 0, 0);
-    `;
-    execSync(`powershell -Command "${ps.replace(/\n/g, " ")}"`);
-  } else if (platform === "darwin") {
-    execSync(`osascript -e 'tell application "System Events" to click at {${x}, ${y}}'`);
+      [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point(${x},${y});
+      $sig='[DllImport("user32.dll")]public static extern void mouse_event(int f,int dx,int dy,int b,int e);';
+      $t=Add-Type -MemberDefinition $sig -Name U32 -Namespace W32 -PassThru;
+      $t::mouse_event(2,0,0,0,0);$t::mouse_event(4,0,0,0,0);
+    `.replace(/\n/g, " ");
+    execSync(`powershell -Command "${ps}"`);
+  } else if (p === "darwin") {
+    execSync(`osascript -e 'tell application "System Events" to click at {${x},${y}}'`);
   } else {
     execSync(`xdotool mousemove ${x} ${y} click 1`);
   }
 }
 
-// ── Type Text ────────────────────────────────────────────
+// ── Type text ────────────────────────────────────────────
 async function typeText(text) {
-  const platform = os.platform();
-  const escaped = text.replace(/'/g, "\\'");
-
-  if (platform === "win32") {
-    const ps = `
-      Add-Type -AssemblyName System.Windows.Forms;
-      [System.Windows.Forms.SendKeys]::SendWait('${escaped}');
-    `;
-    execSync(`powershell -Command "${ps.replace(/\n/g, " ")}"`);
-  } else if (platform === "darwin") {
-    execSync(`osascript -e 'tell application "System Events" to keystroke "${escaped}"'`);
+  const p = os.platform();
+  const safe = text.replace(/'/g, "\\'");
+  if (p === "win32") {
+    const ps = `Add-Type -AssemblyName System.Windows.Forms;[System.Windows.Forms.SendKeys]::SendWait('${safe}');`;
+    execSync(`powershell -Command "${ps}"`);
+  } else if (p === "darwin") {
+    execSync(`osascript -e 'tell application "System Events" to keystroke "${safe}"'`);
   } else {
-    execSync(`xdotool type '${escaped}'`);
+    execSync(`xdotool type '${safe}'`);
   }
 }
 
-// ── Press Key ────────────────────────────────────────────
+// ── Press key ────────────────────────────────────────────
 async function pressKey(key) {
-  const platform = os.platform();
-
-  if (platform === "win32") {
-    const keyMap = { Enter: "{ENTER}", Tab: "{TAB}", Escape: "{ESC}", Backspace: "{BACKSPACE}" };
-    const mappedKey = keyMap[key] || key;
-    const ps = `
-      Add-Type -AssemblyName System.Windows.Forms;
-      [System.Windows.Forms.SendKeys]::SendWait('${mappedKey}');
-    `;
-    execSync(`powershell -Command "${ps.replace(/\n/g, " ")}"`);
-  } else if (platform === "darwin") {
-    const keyMap = { Enter: "return", Tab: "tab", Escape: "escape" };
-    const k = keyMap[key] || key;
-    execSync(`osascript -e 'tell application "System Events" to key code "${k}"'`);
+  const p = os.platform();
+  if (p === "win32") {
+    const map = { Enter:"{ENTER}", Tab:"{TAB}", Escape:"{ESC}", Backspace:"{BACKSPACE}", Space:" " };
+    const ps = `Add-Type -AssemblyName System.Windows.Forms;[System.Windows.Forms.SendKeys]::SendWait('${map[key]||key}');`;
+    execSync(`powershell -Command "${ps}"`);
+  } else if (p === "darwin") {
+    const map = { Enter:"return", Tab:"tab", Escape:"escape", Backspace:"delete" };
+    execSync(`osascript -e 'tell application "System Events" to key code "${map[key]||key}"'`);
   } else {
     execSync(`xdotool key ${key}`);
   }
 }
 
-// ── Main Execute Function ─────────────────────────────────
-async function executeCommand(command) {
-  console.log(`\nExecuting command: "${command}"`);
+// ── Scroll ───────────────────────────────────────────────
+async function scrollPage(x, y, direction, amount = 3) {
+  const p = os.platform();
+  if (p === "win32") {
+    const delta = direction === "up" ? amount * 120 : -amount * 120;
+    const ps = `
+      Add-Type -AssemblyName System.Windows.Forms;
+      [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point(${x},${y});
+      $sig='[DllImport("user32.dll")]public static extern void mouse_event(int f,int dx,int dy,int d,int e);';
+      $t=Add-Type -MemberDefinition $sig -Name U32S -Namespace W32S -PassThru;
+      $t::mouse_event(0x0800,0,0,${delta},0);
+    `.replace(/\n/g, " ");
+    execSync(`powershell -Command "${ps}"`);
+  } else if (p === "darwin") {
+    execSync(`osascript -e 'tell application "System Events" to scroll ${direction === "up" ? "up" : "down"} ${amount}'`);
+  } else {
+    execSync(`xdotool mousemove ${x} ${y} click ${direction === "up" ? 4 : 5}`);
+  }
+}
 
-  // Step 1: Take screenshot
+// ── Main execute function ─────────────────────────────────
+async function executeCommand(command) {
+  console.log(`\nCommand: "${command}"`);
+
+  // Step 1: Screenshot
   console.log("Taking screenshot...");
   const screenshot = await takeScreenshot();
 
-  // Step 2: Ask Aerolink what to do
-  console.log("Asking Aerolink AI...");
+  // Step 2: Ask AI
+  console.log("Calling Aerolink AI...");
   const actions = await callAerolink(command, screenshot);
 
   if (!actions || actions.length === 0) {
-    return { success: false, message: "AI could not determine actions" };
+    return { success: false, message: "AI could not determine actions to take." };
   }
 
-  console.log("Actions to execute:", JSON.stringify(actions, null, 2));
+  console.log(`Got ${actions.length} actions to execute`);
 
-  // Step 3: Execute actions
+  // Step 3: Execute
   const results = await executeActions(actions);
 
-  // Step 4: Get final result
-  const doneAction = results.find((r) => r.action?.action === "done");
-  const errorAction = results.find((r) => r.action?.action === "error");
+  // Step 4: Final result
+  const done  = results.find(r => r.action?.action === "done");
+  const error = results.find(r => r.action?.action === "error");
+
+  // Take final screenshot
+  const finalScreenshot = await takeScreenshot();
 
   return {
-    success: !errorAction,
-    message: doneAction?.message || errorAction?.message || "Task executed",
-    actions: results,
-    screenshot: await takeScreenshot(), // Final state screenshot
+    success: !error,
+    message: done?.action?.message || error?.action?.message || "Task executed",
+    results,
+    screenshot: finalScreenshot,
   };
 }
 
