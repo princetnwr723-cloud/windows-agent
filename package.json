@@ -63,11 +63,13 @@
     },
     "dmg": {
       "title": "Vnus Agent",
+      "background": null,
       "contents": [
         { "x": 130, "y": 220, "type": "file" },
         { "x": 410, "y": 220, "type": "link", "path": "/Applications" }
       ],
-      "writeUpdateInfo": false
+      "writeUpdateInfo": false,
+      "internetEnabled": false
     },
     "extraResources": [
       { "from": "assets/", "to": "assets/", "filter": ["**/*"] }
