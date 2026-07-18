@@ -1,17 +1,13 @@
 // src/agent/brain.js
-// Vnus Agent Brain — Aerolink API + Prompt Caching + Screenshot
+// Vnus Agent Brain — Local Ollama AI + Screenshot + Actions
 
-const { execSync } = require("child_process");
-const path = require("path");
-const fs = require("fs");
-const os = require("os");
-const { aerolinkConfig } = require("../config");
+const { execSync }       = require("child_process");
+const path               = require("path");
+const fs                 = require("fs");
+const os                 = require("os");
+const { runOllamaPrompt, runOllamaVision } = require("./ollamaManager");
 
-const BASE_URL = aerolinkConfig.baseUrl;
-const API_KEY  = aerolinkConfig.apiKey;
-const MODEL    = aerolinkConfig.model;
-
-// ── System prompt (cached — never changes) ────────────────
+// ── System prompt ─────────────────────────────────────────
 const SYSTEM_PROMPT = `You are Vnus, an AI agent running on the user's PC.
 You can control the PC by responding with a JSON array of actions.
 
@@ -33,7 +29,7 @@ Rules:
 4. Always end with "done" or "error"
 5. Respond ONLY with a valid JSON array — no explanation text
 
-Example response:
+Example:
 [
   { "action": "open", "app": "chrome" },
   { "action": "wait", "ms": 1500 },
@@ -69,84 +65,29 @@ async function takeScreenshot() {
   }
 }
 
-// ── Call Aerolink API with prompt caching ─────────────────
-async function callAerolink(command, screenshotBase64) {
-  // User message content
-  const userContent = screenshotBase64
-    ? [
-        {
-          type: "image",
-          source: {
-            type: "base64",
-            media_type: "image/png",
-            data: screenshotBase64,
-          },
-        },
-        {
-          type: "text",
-          text: `Current screen shown above.\nUser command: "${command}"\n\nRespond with JSON actions array only.`,
-        },
-      ]
-    : [
-        {
-          type: "text",
-          text: `User command: "${command}"\n\nRespond with JSON actions array only.`,
-        },
-      ];
+// ── Call local Ollama ─────────────────────────────────────
+async function callLocalAI(command, screenshotBase64, modelConfig) {
+  const { ollamaId, visionOllamaId, visionEnabled } = modelConfig;
+  const userText = `User command: "${command}"\n\nRespond with JSON actions array only.`;
 
-  const body = {
-    model: MODEL,
-    max_tokens: 1024,
-    // Prompt caching — system prompt cached for 5 minutes
-    // Saves tokens + faster response on repeated calls
-    system: [
-      {
-        type: "text",
-        text: SYSTEM_PROMPT,
-        cache_control: { type: "ephemeral" }, // Cache this!
-      },
-    ],
-    messages: [{ role: "user", content: userContent }],
-  };
+  let text = "";
 
   try {
-    const response = await fetch(`${BASE_URL}/v1/messages`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": API_KEY,
-        "anthropic-version": "2023-06-01",
-        "anthropic-beta": "prompt-caching-2024-07-31", // Enable caching
-      },
-      body: JSON.stringify(body),
-    });
-
-    if (!response.ok) {
-      const err = await response.text();
-      console.error("Aerolink API error:", err);
-      return null;
+    if (visionEnabled && visionOllamaId && screenshotBase64) {
+      // Vision model — send screenshot + command
+      const visionText = `Current screen shown above.\n${userText}`;
+      text = await runOllamaVision(visionOllamaId, SYSTEM_PROMPT, visionText, screenshotBase64);
+    } else {
+      // Text only
+      text = await runOllamaPrompt(ollamaId, SYSTEM_PROMPT, userText);
     }
-
-    const data = await response.json();
-
-    // Log cache stats
-    if (data.usage) {
-      console.log("Tokens used:", {
-        input: data.usage.input_tokens,
-        output: data.usage.output_tokens,
-        cache_read: data.usage.cache_read_input_tokens || 0,
-        cache_created: data.usage.cache_creation_input_tokens || 0,
-      });
-    }
-
-    const text = data.content?.[0]?.text || "";
 
     // Parse JSON actions
-    const match = text.match(/\[[\s\S]*\]/);
-    if (match) return JSON.parse(match[0]);
-    return null;
+    const match   = text.match(/\[[\s\S]*\]/);
+    const actions = match ? JSON.parse(match[0]) : null;
+    return actions;
   } catch (err) {
-    console.error("API call error:", err.message);
+    console.error("Local AI error:", err.message);
     return null;
   }
 }
@@ -154,22 +95,18 @@ async function callAerolink(command, screenshotBase64) {
 // ── Execute actions ───────────────────────────────────────
 async function executeActions(actions) {
   const results = [];
-
   for (const action of actions) {
     console.log("Action:", JSON.stringify(action));
     try {
-      if (action.action === "open")       await openApp(action.app);
-      else if (action.action === "click") await mouseClick(action.x, action.y);
-      else if (action.action === "type")  await typeText(action.text);
-      else if (action.action === "key")   await pressKey(action.key);
-      else if (action.action === "wait")  await new Promise(r => setTimeout(r, action.ms || 500));
+      if      (action.action === "open")   await openApp(action.app);
+      else if (action.action === "click")  await mouseClick(action.x, action.y);
+      else if (action.action === "type")   await typeText(action.text);
+      else if (action.action === "key")    await pressKey(action.key);
+      else if (action.action === "wait")   await new Promise(r => setTimeout(r, action.ms || 500));
       else if (action.action === "scroll") await scrollPage(action.x, action.y, action.direction, action.amount);
 
       results.push({ success: true, action });
-
       if (action.action === "done" || action.action === "error") break;
-
-      // Delay between actions
       await new Promise(r => setTimeout(r, 400));
     } catch (err) {
       console.error("Action error:", err.message);
@@ -179,22 +116,22 @@ async function executeActions(actions) {
   return results;
 }
 
-// ── Open App ─────────────────────────────────────────────
+// ── Open App ──────────────────────────────────────────────
 async function openApp(appName) {
-  const p = os.platform();
+  const p   = os.platform();
   const map = {
-    chrome:   { win32: "start chrome",       darwin: "open -a 'Google Chrome'", linux: "google-chrome &" },
-    firefox:  { win32: "start firefox",      darwin: "open -a Firefox",         linux: "firefox &" },
-    notepad:  { win32: "start notepad",      darwin: "open -a TextEdit",        linux: "gedit &" },
-    explorer: { win32: "start explorer",     darwin: "open ~",                  linux: "nautilus ~ &" },
-    terminal: { win32: "start cmd",          darwin: "open -a Terminal",        linux: "x-terminal-emulator &" },
-    vscode:   { win32: "start code",         darwin: "open -a 'Visual Studio Code'", linux: "code &" },
+    chrome:   { win32: "start chrome",   darwin: "open -a 'Google Chrome'",      linux: "google-chrome &" },
+    firefox:  { win32: "start firefox",  darwin: "open -a Firefox",              linux: "firefox &" },
+    notepad:  { win32: "start notepad",  darwin: "open -a TextEdit",             linux: "gedit &" },
+    explorer: { win32: "start explorer", darwin: "open ~",                       linux: "nautilus ~ &" },
+    terminal: { win32: "start cmd",      darwin: "open -a Terminal",             linux: "x-terminal-emulator &" },
+    vscode:   { win32: "start code",     darwin: "open -a 'Visual Studio Code'", linux: "code &" },
   };
-  const cmd = map[appName.toLowerCase()]?.[p];
+  const cmd = map[appName?.toLowerCase()]?.[p];
   execSync(cmd || (p === "win32" ? `start ${appName}` : p === "darwin" ? `open -a "${appName}"` : `${appName} &`), { shell: true });
 }
 
-// ── Mouse click ──────────────────────────────────────────
+// ── Mouse click ───────────────────────────────────────────
 async function mouseClick(x, y) {
   const p = os.platform();
   if (p === "win32") {
@@ -213,9 +150,9 @@ async function mouseClick(x, y) {
   }
 }
 
-// ── Type text ────────────────────────────────────────────
+// ── Type text ─────────────────────────────────────────────
 async function typeText(text) {
-  const p = os.platform();
+  const p    = os.platform();
   const safe = text.replace(/'/g, "\\'");
   if (p === "win32") {
     const ps = `Add-Type -AssemblyName System.Windows.Forms;[System.Windows.Forms.SendKeys]::SendWait('${safe}');`;
@@ -227,22 +164,22 @@ async function typeText(text) {
   }
 }
 
-// ── Press key ────────────────────────────────────────────
+// ── Press key ─────────────────────────────────────────────
 async function pressKey(key) {
   const p = os.platform();
   if (p === "win32") {
-    const map = { Enter:"{ENTER}", Tab:"{TAB}", Escape:"{ESC}", Backspace:"{BACKSPACE}", Space:" " };
-    const ps = `Add-Type -AssemblyName System.Windows.Forms;[System.Windows.Forms.SendKeys]::SendWait('${map[key]||key}');`;
+    const map = { Enter: "{ENTER}", Tab: "{TAB}", Escape: "{ESC}", Backspace: "{BACKSPACE}", Space: " " };
+    const ps  = `Add-Type -AssemblyName System.Windows.Forms;[System.Windows.Forms.SendKeys]::SendWait('${map[key] || key}');`;
     execSync(`powershell -Command "${ps}"`);
   } else if (p === "darwin") {
-    const map = { Enter:"return", Tab:"tab", Escape:"escape", Backspace:"delete" };
-    execSync(`osascript -e 'tell application "System Events" to key code "${map[key]||key}"'`);
+    const map = { Enter: "return", Tab: "tab", Escape: "escape", Backspace: "delete" };
+    execSync(`osascript -e 'tell application "System Events" to key code "${map[key] || key}"'`);
   } else {
     execSync(`xdotool key ${key}`);
   }
 }
 
-// ── Scroll ───────────────────────────────────────────────
+// ── Scroll ────────────────────────────────────────────────
 async function scrollPage(x, y, direction, amount = 3) {
   const p = os.platform();
   if (p === "win32") {
@@ -262,37 +199,29 @@ async function scrollPage(x, y, direction, amount = 3) {
   }
 }
 
-// ── Main execute function ─────────────────────────────────
-async function executeCommand(command) {
+// ── Main execute ──────────────────────────────────────────
+async function executeCommand(command, modelConfig) {
   console.log(`\nCommand: "${command}"`);
+  console.log(`Model: ${modelConfig.ollamaId} | Vision: ${modelConfig.visionEnabled}`);
 
-  // Step 1: Screenshot
-  console.log("Taking screenshot...");
-  const screenshot = await takeScreenshot();
+  // Screenshot
+  const screenshot = modelConfig.visionEnabled ? await takeScreenshot() : null;
 
-  // Step 2: Ask AI
-  console.log("Calling Aerolink AI...");
-  const actions = await callAerolink(command, screenshot);
-
+  // Call AI
+  const actions = await callLocalAI(command, screenshot, modelConfig);
   if (!actions || actions.length === 0) {
-    return { success: false, message: "AI could not determine actions to take." };
+    return { success: false, message: "AI could not determine actions." };
   }
 
-  console.log(`Got ${actions.length} actions to execute`);
-
-  // Step 3: Execute
-  const results = await executeActions(actions);
-
-  // Step 4: Final result
-  const done  = results.find(r => r.action?.action === "done");
-  const error = results.find(r => r.action?.action === "error");
-
-  // Take final screenshot
-  const finalScreenshot = await takeScreenshot();
+  // Execute
+  const results       = await executeActions(actions);
+  const done          = results.find(r => r.action?.action === "done");
+  const error         = results.find(r => r.action?.action === "error");
+  const finalScreenshot = modelConfig.visionEnabled ? await takeScreenshot() : null;
 
   return {
-    success: !error,
-    message: done?.action?.message || error?.action?.message || "Task executed",
+    success:    !error,
+    message:    done?.action?.message || error?.action?.message || "Task executed",
     results,
     screenshot: finalScreenshot,
   };
