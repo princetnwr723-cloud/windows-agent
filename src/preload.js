@@ -1,18 +1,19 @@
+// src/preload.js
 const { contextBridge, ipcRenderer } = require("electron");
 
-// Expose safe APIs to renderer (splash.html)
 contextBridge.exposeInMainWorld("vnusAgent", {
-  // Receive agent data (code, pcName etc)
-  onAgentData: (callback) => ipcRenderer.on("agent-data", (_, data) => callback(data)),
+  // Existing
+  onAgentData:         (cb) => ipcRenderer.on("agent-data",          (_, d) => cb(d)),
+  onWorkspaceConnected:(cb) => ipcRenderer.on("workspace-connected",  (_, d) => cb(d)),
+  onCodeRefreshed:     (cb) => ipcRenderer.on("code-refreshed",       (_, d) => cb(d)),
+  closeSplash:         ()  => ipcRenderer.send("close-splash"),
+  openDashboard:       ()  => ipcRenderer.send("open-dashboard"),
+  refreshCode:         ()  => ipcRenderer.send("refresh-code"),
 
-  // Receive workspace connected event
-  onWorkspaceConnected: (callback) => ipcRenderer.on("workspace-connected", (_, data) => callback(data)),
-
-  // Receive code refresh
-  onCodeRefreshed: (callback) => ipcRenderer.on("code-refreshed", (_, code) => callback(code)),
-
-  // Actions
-  closeSplash: () => ipcRenderer.send("close-splash"),
-  openDashboard: () => ipcRenderer.send("open-dashboard"),
-  refreshCode: () => ipcRenderer.send("refresh-code"),
+  // Model picker
+  onShowModelPicker:   (cb) => ipcRenderer.on("show-model-picker",   (_, d) => cb(d)),
+  onSetupProgress:     (cb) => ipcRenderer.on("setup-progress",      (_, d) => cb(d)),
+  onSetupError:        (cb) => ipcRenderer.on("setup-error",         (_, d) => cb(d)),
+  onModelReady:        (cb) => ipcRenderer.on("model-ready",         ()     => cb()),
+  selectModel:         (data) => ipcRenderer.send("model-selected", data),
 });
