@@ -1,94 +1,99 @@
 // src/main.js
-const { app, BrowserWindow, Tray, Menu, nativeImage, shell, dialog, ipcMain, screen, systemPreferences } = require("electron");
-const path = require("path");
-const os   = require("os");
-const fs   = require("fs");
-const { execSync, exec } = require("child_process");
+const {
+  app, BrowserWindow, Tray, Menu, nativeImage,
+  shell, dialog, ipcMain, screen, systemPreferences,
+} = require("electron");
+const path   = require("path");
+const os     = require("os");
+const fs     = require("fs");
+const { execSync } = require("child_process");
 
-const { firebaseConfig }       = require("./config");
-const { startCommandListener } = require("./agent/listener");
-const { getPCSpecs }           = require("./agent/specs");
-const { getModelOptions }      = require("./agent/modelSelector");
+const { firebaseConfig }          = require("./config");
+const { startCommandListener }    = require("./agent/listener");
+const { getPCSpecs }              = require("./agent/specs");
+const { getModelOptions }         = require("./agent/modelSelector");
 const { setupModel, isOllamaRunning, startOllama } = require("./agent/ollamaManager");
+const { generatePermanentCode }   = require("./agent/machineCode");
 
 // ── App Config ────────────────────────────────────────────
-const IS_DEV   = process.argv.includes("--dev");
-const PLATFORM = os.platform();
-const DATA_DIR = path.join(app.getPath("userData"), "vnus-agent");
+const PLATFORM  = os.platform();
+const DATA_DIR  = path.join(app.getPath("userData"), "vnus-agent");
 const STATE_FILE = path.join(DATA_DIR, "state.json");
 
-let tray         = null;
-let splashWindow = null;
-let isQuitting   = false;
+let tray            = null;
+let splashWindow    = null;
+let workspaceWindow = null;
+let isQuitting      = false;
 
 // ── State ─────────────────────────────────────────────────
 function ensureDataDir() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 }
+
 function loadState() {
   ensureDataDir();
   try {
-    if (fs.existsSync(STATE_FILE)) return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    if (fs.existsSync(STATE_FILE))
+      return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
   } catch {}
   return {
-    isSetup:        false,
-    agentCode:      null,
-    userId:         null,
-    codeCreatedAt:  null,
-    plan:           "free",
-    selectedModel:  null,   // { ollamaId, name, visionEnabled, visionOllamaId }
-    modelReady:     false,
+    isSetup:       false,
+    agentCode:     null,   // permanent machine-based code
+    userId:        null,
+    plan:          "free",
+    selectedModel: null,
+    modelReady:    false,
+    userDisconnected: false,
   };
 }
+
 function saveState(state) {
   ensureDataDir();
   fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
 }
 
-// ── Generate code ─────────────────────────────────────────
-function generateAgentCode() {
-  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  let code = "";
-  for (let i = 0; i < 10; i++) code += chars[Math.floor(Math.random() * chars.length)];
-  return code;
-}
-
 // ── PC Info ───────────────────────────────────────────────
 function getPCInfo() {
   return {
-    pcName:      os.hostname(),
-    os:          `${getOSName()} ${os.release()}`,
-    platform:    PLATFORM,
-    arch:        os.arch(),
-    username:    os.userInfo().username,
+    pcName:   os.hostname(),
+    os:       `${getOSName()} ${os.release()}`,
+    platform: PLATFORM,
+    arch:     os.arch(),
+    username: os.userInfo().username,
     totalMemory: Math.round(os.totalmem() / (1024 ** 3)) + " GB",
   };
 }
+
 function getOSName() {
   if (PLATFORM === "win32")  return "Windows";
   if (PLATFORM === "darwin") return "macOS";
   return "Linux";
 }
 
-// ── Firestore ─────────────────────────────────────────────
+// ── Firestore helpers ─────────────────────────────────────
 async function saveCodeToFirestore(code, pcInfo) {
   const url  = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/(default)/documents/agent_connections/${code}?key=${firebaseConfig.apiKey}`;
   const body = {
     fields: {
-      code:      { stringValue: code },
-      status:    { stringValue: "waiting" },
-      userId:    { nullValue: null },
-      pcName:    { stringValue: pcInfo.pcName },
-      os:        { stringValue: pcInfo.os },
-      platform:  { stringValue: pcInfo.platform },
-      arch:      { stringValue: pcInfo.arch },
-      username:  { stringValue: pcInfo.username },
-      createdAt: { stringValue: new Date().toISOString() },
-      expiresAt: { stringValue: new Date(Date.now() + 10 * 60 * 1000).toISOString() },
+      code:            { stringValue: code },
+      status:          { stringValue: "waiting" },
+      userId:          { nullValue: null },
+      userDisconnected:{ booleanValue: false },
+      pcName:          { stringValue: pcInfo.pcName },
+      os:              { stringValue: pcInfo.os },
+      platform:        { stringValue: pcInfo.platform },
+      arch:            { stringValue: pcInfo.arch },
+      username:        { stringValue: pcInfo.username },
+      createdAt:       { stringValue: new Date().toISOString() },
+      permanent:       { booleanValue: true },
     },
   };
   try {
-    const res = await fetch(url, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const res = await fetch(url, {
+      method:  "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify(body),
+    });
     return res.ok;
   } catch (err) {
     console.error("Firestore error:", err);
@@ -96,7 +101,35 @@ async function saveCodeToFirestore(code, pcInfo) {
   }
 }
 
-// ── Fetch user plan from Firestore ────────────────────────
+async function getFirestoreDoc(code) {
+  const url = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/(default)/documents/agent_connections/${code}?key=${firebaseConfig.apiKey}`;
+  try {
+    const res  = await fetch(url);
+    const data = await res.json();
+    return data?.fields || null;
+  } catch {
+    return null;
+  }
+}
+
+async function updateFirestoreField(code, fields) {
+  const fieldPaths = Object.keys(fields).map(k => `updateMask.fieldPaths=${k}`).join("&");
+  const url = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/(default)/documents/agent_connections/${code}?key=${firebaseConfig.apiKey}&${fieldPaths}`;
+  const firestoreFields = {};
+  for (const [k, v] of Object.entries(fields)) {
+    if (typeof v === "string")  firestoreFields[k] = { stringValue: v };
+    if (typeof v === "boolean") firestoreFields[k] = { booleanValue: v };
+    if (v === null)             firestoreFields[k] = { nullValue: null };
+  }
+  try {
+    await fetch(url, {
+      method:  "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({ fields: firestoreFields }),
+    });
+  } catch {}
+}
+
 async function fetchUserPlan(userId) {
   const url = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/(default)/documents/users/${userId}?key=${firebaseConfig.apiKey}`;
   try {
@@ -109,112 +142,155 @@ async function fetchUserPlan(userId) {
 }
 
 // ── Listen for connection ─────────────────────────────────
-function listenForConnection(code, onConnected) {
-  const url  = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/(default)/documents/agent_connections/${code}?key=${firebaseConfig.apiKey}`;
+function listenForConnection(code, onConnected, onDisconnected) {
   const poll = setInterval(async () => {
     try {
-      const res    = await fetch(url);
-      const data   = await res.json();
-      const status = data?.fields?.status?.stringValue;
-      const userId = data?.fields?.userId?.stringValue;
-      if (status === "connected" && userId) {
+      const fields = await getFirestoreDoc(code);
+      if (!fields) return;
+
+      const status          = fields?.status?.stringValue;
+      const userId          = fields?.userId?.stringValue;
+      const userDisconnected = fields?.userDisconnected?.booleanValue;
+
+      // User disconnected from dashboard
+      if (userDisconnected && status === "disconnected") {
+        onDisconnected?.();
+        return;
+      }
+
+      // Connected!
+      if (status === "connected" && userId && !userDisconnected) {
         clearInterval(poll);
         onConnected(userId);
       }
     } catch {}
   }, 3000);
-  setTimeout(() => clearInterval(poll), 15 * 60 * 1000);
+
   return poll;
 }
 
 // ── Platform permissions ──────────────────────────────────
 async function requestPermissions() {
-  if (PLATFORM === "win32") {
-    const r = await dialog.showMessageBox({
-      type: "info", title: "Vnus Agent — Permissions",
-      message: "Vnus Agent needs permissions to run.",
-      detail: "✅ File system access\n✅ Network access\n✅ Run at startup\n✅ Install local AI model",
-      buttons: ["Grant & Continue", "Cancel"], defaultId: 0, cancelId: 1,
-    });
-    return r.response === 0;
-  }
+  const detail = PLATFORM === "darwin"
+    ? "✅ Accessibility access (to control apps)\n✅ Full Disk Access\n✅ Network access\n✅ Install local AI model"
+    : "✅ File system access\n✅ Network access\n✅ Run at startup\n✅ Install local AI model";
+
+  const r = await dialog.showMessageBox({
+    type: "info", title: "Vnus Agent — Permissions",
+    message: "Vnus Agent needs a few permissions to work.",
+    detail,
+    buttons: ["Grant & Continue", "Cancel"],
+    defaultId: 0, cancelId: 1,
+  });
+  if (r.response !== 0) return false;
+
   if (PLATFORM === "darwin") {
-    await dialog.showMessageBox({
-      type: "info", title: "Vnus Agent — Permissions",
-      message: "Vnus Agent needs a few permissions.",
-      detail: "✅ Accessibility access\n✅ Full Disk Access\n✅ Network access\n✅ Install local AI model",
-      buttons: ["Continue"], defaultId: 0,
-    });
     systemPreferences.isTrustedAccessibilityClient(true);
-    addToMacStartup();
-    return true;
   }
-  addToLinuxStartup();
   return true;
 }
 
-// ── Startup helpers ───────────────────────────────────────
-function addToMacStartup() {
+// ── Startup ───────────────────────────────────────────────
+function addToStartup() {
   try {
-    const appPath       = app.getPath("exe");
-    const launchDir     = path.join(os.homedir(), "Library", "LaunchAgents");
-    const plistPath     = path.join(launchDir, "ai.vnus.agent.plist");
-    if (!fs.existsSync(launchDir)) fs.mkdirSync(launchDir, { recursive: true });
-    const plist = `<?xml version="1.0" encoding="UTF-8"?>
+    const appPath = app.getPath("exe");
+    if (PLATFORM === "win32") {
+      execSync(`reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" /v "VnusAgent" /t REG_SZ /d "${appPath}" /f`);
+    } else if (PLATFORM === "darwin") {
+      const launchDir = path.join(os.homedir(), "Library", "LaunchAgents");
+      const plistPath = path.join(launchDir, "ai.vnus.agent.plist");
+      if (!fs.existsSync(launchDir)) fs.mkdirSync(launchDir, { recursive: true });
+      fs.writeFileSync(plistPath, `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>ai.vnus.agent</string>
   <key>ProgramArguments</key><array><string>${appPath}</string></array>
   <key>RunAtLoad</key><true/><key>KeepAlive</key><false/>
-</dict></plist>`;
-    fs.writeFileSync(plistPath, plist);
-    execSync(`launchctl load "${plistPath}"`);
-  } catch {}
-}
-function addToLinuxStartup() {
-  try {
-    const appPath     = app.getPath("exe");
-    const autostartDir = path.join(os.homedir(), ".config", "autostart");
-    if (!fs.existsSync(autostartDir)) fs.mkdirSync(autostartDir, { recursive: true });
-    fs.writeFileSync(path.join(autostartDir, "vnus-agent.desktop"),
-      `[Desktop Entry]\nType=Application\nName=Vnus Agent\nExec=${appPath}\nHidden=false\nNoDisplay=false\nX-GNOME-Autostart-enabled=true`);
-  } catch {}
-}
-function addToWindowsStartup() {
-  try {
-    const appPath = app.getPath("exe");
-    execSync(`reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" /v "VnusAgent" /t REG_SZ /d "${appPath}" /f`);
-  } catch {}
-}
-function addToStartup() {
-  if (PLATFORM === "win32")  addToWindowsStartup();
-  if (PLATFORM === "darwin") addToMacStartup();
-  if (PLATFORM === "linux")  addToLinuxStartup();
+</dict></plist>`);
+      execSync(`launchctl load "${plistPath}"`);
+    } else {
+      const autostartDir = path.join(os.homedir(), ".config", "autostart");
+      if (!fs.existsSync(autostartDir)) fs.mkdirSync(autostartDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(autostartDir, "vnus-agent.desktop"),
+        `[Desktop Entry]\nType=Application\nName=Vnus Agent\nExec=${appPath}\nHidden=false\nNoDisplay=false\nX-GNOME-Autostart-enabled=true`
+      );
+    }
+  } catch (err) {
+    console.error("Startup setup error:", err.message);
+  }
 }
 
 // ── Splash Window ─────────────────────────────────────────
-function createSplashWindow(code, isFirstTime) {
+function createSplashWindow() {
+  if (splashWindow) { splashWindow.focus(); return; }
   const { width, height } = screen.getPrimaryDisplay().workAreaSize;
   splashWindow = new BrowserWindow({
     width: 480, height: 680,
     x: Math.round((width - 480) / 2),
     y: Math.round((height - 680) / 2),
     frame: false, resizable: false, alwaysOnTop: true,
-    webPreferences: { nodeIntegration: false, contextIsolation: true, preload: path.join(__dirname, "preload.js") },
-    backgroundColor: "#050505", show: false,
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+      preload: path.join(__dirname, "preload.js"),
+    },
+    backgroundColor: "#050505",
+    show: false,
     ...(PLATFORM === "darwin" ? { vibrancy: "dark", visualEffectState: "active" } : {}),
   });
   splashWindow.loadFile(path.join(__dirname, "../renderer/splash.html"));
-  splashWindow.once("ready-to-show", () => {
-    splashWindow.show();
-    splashWindow.webContents.send("agent-data", {
-      code, isFirstTime,
-      pcName: os.hostname(),
-      os:     getOSName(),
-      platform: PLATFORM,
-    });
-  });
+  splashWindow.once("ready-to-show", () => splashWindow.show());
   splashWindow.on("closed", () => { splashWindow = null; });
+}
+
+// ── Workspace Window (Electron-embedded dashboard) ────────
+function createWorkspaceWindow(state) {
+  if (workspaceWindow) { workspaceWindow.focus(); return; }
+
+  const { width, height } = screen.getPrimaryDisplay().workAreaSize;
+
+  workspaceWindow = new BrowserWindow({
+    width:  Math.min(1200, width  - 40),
+    height: Math.min(800,  height - 40),
+    x: Math.round((width  - Math.min(1200, width  - 40)) / 2),
+    y: Math.round((height - Math.min(800,  height - 40)) / 2),
+    frame:     true,
+    resizable: true,
+    title:     "Vnus Agent — Workspace",
+    webPreferences: {
+      nodeIntegration:  false,
+      contextIsolation: true,
+      preload: path.join(__dirname, "preload.js"),
+    },
+    backgroundColor: "#050505",
+    show: false,
+    ...(PLATFORM === "darwin" ? {
+      titleBarStyle: "hiddenInset",
+      vibrancy:      "dark",
+    } : {}),
+  });
+
+  // Load the dashboard workspace page from deployed website
+  const workspaceUrl = `https://vnus.ai/dashboard/workspace/${state.agentCode}?agent=true`;
+  workspaceWindow.loadURL(workspaceUrl);
+
+  workspaceWindow.once("ready-to-show", () => {
+    workspaceWindow.show();
+    // Close splash when workspace opens
+    if (splashWindow) splashWindow.close();
+  });
+
+  workspaceWindow.on("closed", () => { workspaceWindow = null; });
+
+  // Inject agent=true flag so website knows it's embedded
+  workspaceWindow.webContents.on("did-finish-load", () => {
+    workspaceWindow?.webContents.executeJavaScript(`
+      window.__VNUS_AGENT__ = true;
+      window.__WORKSPACE_ID__ = "${state.agentCode}";
+      window.__PLAN__ = "${state.plan}";
+    `);
+  });
 }
 
 // ── System Tray ───────────────────────────────────────────
@@ -228,44 +304,79 @@ function createTray(state) {
   tray.setToolTip("Vnus Agent — Running");
 
   const updateMenu = (connected) => {
+    const st = loadState();
     const menu = Menu.buildFromTemplate([
       { label: "Vnus Agent", enabled: false },
       { type: "separator" },
-      { label: connected ? "● Connected" : "○ Waiting...", enabled: false },
+      {
+        label:   connected ? "● Connected" : "○ Not connected",
+        enabled: false,
+      },
       { type: "separator" },
-      { label: "Show Agent Code", click: () => { const st = loadState(); createSplashWindow(st.agentCode, false); } },
-      { label: "Open Dashboard", click: () => shell.openExternal("https://vnus.ai/dashboard") },
+      {
+        label: "Open Workspace",
+        enabled: connected,
+        click: () => createWorkspaceWindow(st),
+      },
+      {
+        label: "Open Dashboard",
+        click: () => shell.openExternal("https://vnus.ai/dashboard"),
+      },
+      {
+        label: "Show Agent Code",
+        click: () => {
+          createSplashWindow();
+          splashWindow?.webContents.send("agent-data", {
+            code:      st.agentCode,
+            pcName:    os.hostname(),
+            os:        getOSName(),
+            platform:  PLATFORM,
+            connected,
+            plan:      st.plan,
+          });
+        },
+      },
       { type: "separator" },
-      { label: "Quit", click: () => { isQuitting = true; app.quit(); } },
+      {
+        label: "Quit Vnus Agent",
+        click: () => { isQuitting = true; app.quit(); },
+      },
     ]);
     tray.setContextMenu(menu);
   };
 
-  updateMenu(!!state.userId);
-  tray.on("double-click", () => { const st = loadState(); createSplashWindow(st.agentCode, false); });
+  updateMenu(!!state.userId && !state.userDisconnected);
+
+  // Double-click tray → open workspace or splash
+  tray.on("double-click", () => {
+    const st = loadState();
+    if (st.userId && st.modelReady && !st.userDisconnected) {
+      createWorkspaceWindow(st);
+    } else {
+      createSplashWindow();
+    }
+  });
+
   return updateMenu;
 }
 
 // ── IPC Handlers ──────────────────────────────────────────
-ipcMain.on("close-splash", () => { if (splashWindow) splashWindow.close(); });
-ipcMain.on("open-dashboard", () => shell.openExternal("https://vnus.ai/dashboard"));
-
-ipcMain.on("refresh-code", async (event) => {
-  const state  = loadState();
-  const pcInfo = getPCInfo();
-  const code   = generateAgentCode();
-  await saveCodeToFirestore(code, pcInfo);
-  state.agentCode      = code;
-  state.codeCreatedAt  = new Date().toISOString();
-  saveState(state);
-  event.reply("code-refreshed", code);
+ipcMain.on("close-splash", () => {
+  if (splashWindow) splashWindow.close();
 });
 
-// Model selected by user in splash
+ipcMain.on("open-dashboard", () => {
+  shell.openExternal("https://vnus.ai/dashboard");
+});
+
+ipcMain.on("open-workspace", () => {
+  const st = loadState();
+  createWorkspaceWindow(st);
+});
+
+// Model selected by user → start download
 ipcMain.on("model-selected", async (event, { modelOption, visionEnabled, visionModel }) => {
   const state = loadState();
-
-  // Save selection
   state.selectedModel = {
     ollamaId:       modelOption.ollamaId,
     name:           modelOption.name,
@@ -274,8 +385,9 @@ ipcMain.on("model-selected", async (event, { modelOption, visionEnabled, visionM
   };
   saveState(state);
 
-  // Start setup
-  splashWindow?.webContents.send("setup-progress", { step: "ollama", message: "Setting up AI engine...", percent: 0 });
+  splashWindow?.webContents.send("setup-progress", {
+    step: "ollama", message: "Setting up AI engine...", percent: 0,
+  });
 
   const modelsToSetup = [modelOption.ollamaId];
   if (visionEnabled && visionModel) modelsToSetup.push(visionModel.ollamaId);
@@ -293,113 +405,196 @@ ipcMain.on("model-selected", async (event, { modelOption, visionEnabled, visionM
   state.modelReady = true;
   saveState(state);
   splashWindow?.webContents.send("model-ready");
+
+  // Auto open workspace window after model is ready!
+  if (state.userId) {
+    setTimeout(() => createWorkspaceWindow(loadState()), 1500);
+  }
 });
 
 // ── App Ready ─────────────────────────────────────────────
 app.whenReady().then(async () => {
   if (PLATFORM === "darwin") app.dock.hide();
 
+  // Single instance
   const gotLock = app.requestSingleInstanceLock();
   if (!gotLock) { app.quit(); return; }
 
   app.on("second-instance", () => {
-    if (splashWindow) splashWindow.focus();
-    else { const st = loadState(); createSplashWindow(st.agentCode, false); }
+    const st = loadState();
+    if (st.userId && st.modelReady && !st.userDisconnected) {
+      createWorkspaceWindow(st);
+    } else {
+      createSplashWindow();
+    }
   });
 
-  let state       = loadState();
-  const isFirst   = !state.isSetup;
-  const pcInfo    = getPCInfo();
-  const specs     = getPCSpecs();
+  let state = loadState();
 
-  if (isFirst) {
+  // ── Generate PERMANENT machine-based code ──────────────
+  const permanentCode = generatePermanentCode();
+
+  // First time setup
+  if (!state.isSetup) {
     const granted = await requestPermissions();
     if (!granted) { app.quit(); return; }
+
     addToStartup();
 
-    const code = generateAgentCode();
-    await saveCodeToFirestore(code, pcInfo);
+    const pcInfo = getPCInfo();
+    await saveCodeToFirestore(permanentCode, pcInfo);
 
     state = {
-      isSetup:       true,
-      agentCode:     code,
-      userId:        null,
-      codeCreatedAt: new Date().toISOString(),
-      plan:          "free",
-      selectedModel: null,
-      modelReady:    false,
+      isSetup:          true,
+      agentCode:        permanentCode,
+      userId:           null,
+      plan:             "free",
+      selectedModel:    null,
+      modelReady:       false,
+      userDisconnected: false,
     };
     saveState(state);
-    createSplashWindow(code, true);
-
-    // Send specs to splash for model picker
-    splashWindow?.once("ready-to-show", () => {
-      const modelOptions = getModelOptions("free", specs);
-      splashWindow?.webContents.send("show-model-picker", { specs, modelOptions });
-    });
-
-    listenForConnection(code, async (userId) => {
-      state.userId = userId;
-      // Fetch plan from Firestore
-      const plan   = await fetchUserPlan(userId);
-      state.plan   = plan;
-
-      // Re-compute model options with actual plan
-      if (!state.modelReady) {
-        const modelOptions = getModelOptions(plan, specs);
-        splashWindow?.webContents.send("show-model-picker", { specs, modelOptions, plan });
-      }
-
-      saveState(state);
-      splashWindow?.webContents.send("workspace-connected", { userId, plan });
-    });
-
   } else {
-    // Returning user
-    const codeAge = state.codeCreatedAt ? Date.now() - new Date(state.codeCreatedAt).getTime() : Infinity;
-    if (!state.agentCode || codeAge > 10 * 60 * 1000) {
-      const code = generateAgentCode();
-      await saveCodeToFirestore(code, pcInfo);
-      state.agentCode     = code;
-      state.codeCreatedAt = new Date().toISOString();
-      saveState(state);
+    // Returning user — ensure code is in Firestore (in case it was wiped)
+    state.agentCode = permanentCode;
+
+    // Check if userDisconnected flag is set in Firestore
+    const firestoreDoc = await getFirestoreDoc(permanentCode);
+    const userDisconnected = firestoreDoc?.userDisconnected?.booleanValue || false;
+
+    if (userDisconnected) {
+      // User manually disconnected — reset connection
+      state.userId          = null;
+      state.userDisconnected = true;
+      await updateFirestoreField(permanentCode, {
+        status: "waiting",
+        userId: null,
+        userDisconnected: false,
+      });
+    } else if (!state.userId) {
+      // Make sure Firestore has correct status
+      const pcInfo = getPCInfo();
+      await saveCodeToFirestore(permanentCode, pcInfo);
     }
 
-    // If model not ready, show picker again
-    if (!state.modelReady || !state.selectedModel) {
-      createSplashWindow(state.agentCode, false);
-      const plan         = state.userId ? await fetchUserPlan(state.userId) : "free";
+    saveState(state);
+  }
+
+  // Get PC specs for model selection
+  const specs = getPCSpecs();
+
+  // Create splash
+  createSplashWindow();
+
+  // Send initial data to splash
+  splashWindow?.once("ready-to-show", () => {
+    const st = loadState();
+    splashWindow?.webContents.send("agent-data", {
+      code:      st.agentCode,
+      pcName:    os.hostname(),
+      os:        getOSName(),
+      platform:  PLATFORM,
+      connected: !!st.userId && !st.userDisconnected,
+      plan:      st.plan,
+    });
+
+    // If model not ready → show model picker
+    if (!st.modelReady || !st.selectedModel) {
+      const plan         = st.plan || "free";
       const modelOptions = getModelOptions(plan, specs);
-      splashWindow?.once("ready-to-show", () => {
-        splashWindow?.webContents.send("show-model-picker", { specs, modelOptions, plan });
+      splashWindow?.webContents.send("show-model-picker", {
+        specs, modelOptions, plan,
+      });
+    } else if (st.userId && !st.userDisconnected) {
+      // Already connected + model ready → open workspace directly
+      setTimeout(() => createWorkspaceWindow(loadState()), 500);
+    }
+  });
+
+  // Create tray
+  const updateMenu = createTray(state);
+
+  // Start connection listener if not connected
+  if (!state.userId || state.userDisconnected) {
+    const poll = listenForConnection(
+      permanentCode,
+      // onConnected
+      async (userId) => {
+        const plan = await fetchUserPlan(userId);
+        const st   = loadState();
+        st.userId           = userId;
+        st.plan             = plan;
+        st.userDisconnected = false;
+        saveState(st);
+        updateMenu(true);
+
+        // Update model options with actual plan
+        if (!st.modelReady) {
+          const modelOptions = getModelOptions(plan, specs);
+          splashWindow?.webContents.send("show-model-picker", {
+            specs, modelOptions, plan,
+          });
+        }
+
+        splashWindow?.webContents.send("workspace-connected", { userId, plan });
+
+        // Start command listener
+        if (st.modelReady && st.selectedModel) {
+          startCommandListener(permanentCode, firebaseConfig, st.selectedModel);
+          // Auto open workspace
+          setTimeout(() => createWorkspaceWindow(loadState()), 1000);
+        }
+      },
+      // onDisconnected
+      () => {
+        const st = loadState();
+        st.userDisconnected = true;
+        st.userId           = null;
+        saveState(st);
+        updateMenu(false);
+        // Close workspace window
+        if (workspaceWindow) workspaceWindow.close();
+        // Show splash
+        createSplashWindow();
+        splashWindow?.webContents.send("agent-data", {
+          code:      permanentCode,
+          pcName:    os.hostname(),
+          os:        getOSName(),
+          platform:  PLATFORM,
+          connected: false,
+          plan:      "free",
+        });
+      }
+    );
+  } else {
+    // Already connected
+    updateMenu(true);
+    if (state.modelReady && state.selectedModel) {
+      startCommandListener(permanentCode, firebaseConfig, state.selectedModel);
+      // Open workspace window directly
+      setTimeout(() => createWorkspaceWindow(state), 800);
+    } else {
+      // Model not ready — show picker
+      const modelOptions = getModelOptions(state.plan, specs);
+      splashWindow?.webContents.send("show-model-picker", {
+        specs, modelOptions, plan: state.plan,
       });
     }
   }
-
-  const updateMenu = createTray(state);
-
-  // If already connected + model ready → start listener
-  if (state.userId && state.modelReady && state.selectedModel) {
-    updateMenu(true);
-    startCommandListener(state.agentCode, firebaseConfig, state.selectedModel);
-  } else if (!state.userId && state.agentCode) {
-    listenForConnection(state.agentCode, async (userId) => {
-      state.userId = userId;
-      const plan   = await fetchUserPlan(userId);
-      state.plan   = plan;
-      saveState(state);
-      updateMenu(true);
-      splashWindow?.webContents.send("workspace-connected", { userId, plan });
-      if (state.modelReady && state.selectedModel) {
-        startCommandListener(state.agentCode, firebaseConfig, state.selectedModel);
-      }
-    });
-  }
 });
 
-app.on("window-all-closed", (e) => { if (!isQuitting) e.preventDefault(); });
+app.on("window-all-closed", (e) => {
+  // Keep running in tray
+  if (!isQuitting) e.preventDefault();
+});
+
 app.on("before-quit", () => { isQuitting = true; });
+
 app.on("activate", () => {
   const st = loadState();
-  if (!splashWindow) createSplashWindow(st.agentCode, false);
+  if (st.userId && st.modelReady && !st.userDisconnected) {
+    createWorkspaceWindow(st);
+  } else {
+    createSplashWindow();
+  }
 });
