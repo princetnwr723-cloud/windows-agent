@@ -422,7 +422,20 @@ const PLAN_CONFIGS = {
     visionAuto:    false,
     taskLimit:     1250,
     getOptions: (ramGB) => {
-      if (ramGB < 16) {
+      if (ramGB < 10) {
+        // 8GB users — best they can run within 50% RAM rule (max 4GB model)
+        return [
+          { ...MODELS.qwen35_4b,      tag: "Lightweight" },
+          { ...MODELS.phi4_mini,      tag: "Recommended", recommended: true },
+          { ...MODELS.deepseek_r1_8b, tag: "Best Reasoning" },
+        ];
+      } else if (ramGB < 16) {
+        return [
+          { ...MODELS.qwen35_4b,       tag: "Fast" },
+          { ...MODELS.qwen35_9b,       tag: "Recommended", recommended: true },
+          { ...MODELS.deepseek_r1_8b,  tag: "Best Reasoning" },
+        ];
+      } else if (ramGB < 22) {
         return [
           { ...MODELS.qwen35_9b,       tag: "Fast" },
           { ...MODELS.qwen25_coder_14b,tag: "Recommended", recommended: true },
@@ -467,10 +480,24 @@ const PLAN_CONFIGS = {
     visionAuto:    true,
     taskLimit:     5000,
     getOptions: (ramGB) => {
-      if (ramGB < 28) {
+      if (ramGB < 10) {
+        // 8GB — best within 50% RAM rule (max 4GB model)
         return [
-          { ...MODELS.qwen35_14b,      tag: "Fast" },
-          { ...MODELS.qwen3_30b_moe,   tag: "Recommended ⭐", recommended: true },
+          { ...MODELS.qwen35_4b,      tag: "Lightweight" },
+          { ...MODELS.phi4_mini,      tag: "Recommended", recommended: true },
+          { ...MODELS.deepseek_r1_8b, tag: "Best Reasoning" },
+        ];
+      } else if (ramGB < 18) {
+        // 16GB — max 8GB model
+        return [
+          { ...MODELS.qwen35_9b,       tag: "Fast" },
+          { ...MODELS.qwen25_coder_14b,tag: "Recommended", recommended: true },
+          { ...MODELS.deepseek_r1_8b,  tag: "Best Reasoning" },
+        ];
+      } else if (ramGB < 28) {
+        return [
+          { ...MODELS.qwen25_coder_14b,tag: "Fast" },
+          { ...MODELS.qwen35_14b,      tag: "Recommended", recommended: true },
           { ...MODELS.deepseek_r1_14b, tag: "Best Reasoning" },
         ];
       } else if (ramGB < 50) {
@@ -513,11 +540,25 @@ const PLAN_CONFIGS = {
     visionAuto:    true,
     taskLimit:     Infinity,
     getOptions: (ramGB) => {
-      if (ramGB < 32) {
+      if (ramGB < 10) {
+        // 8GB — best within 50% RAM rule
         return [
-          { ...MODELS.qwen3_30b_moe,   tag: "Fast ⭐" },
-          { ...MODELS.qwen3_coder_30b, tag: "Recommended", recommended: true },
-          { ...MODELS.deepseek_r1_32b, tag: "Best Reasoning" },
+          { ...MODELS.qwen35_4b,      tag: "Lightweight" },
+          { ...MODELS.phi4_mini,      tag: "Recommended", recommended: true },
+          { ...MODELS.deepseek_r1_8b, tag: "Best Reasoning" },
+        ];
+      } else if (ramGB < 18) {
+        // 16GB — max 8GB model
+        return [
+          { ...MODELS.qwen35_9b,       tag: "Fast" },
+          { ...MODELS.qwen25_coder_14b,tag: "Recommended", recommended: true },
+          { ...MODELS.deepseek_r1_8b,  tag: "Best Reasoning" },
+        ];
+      } else if (ramGB < 32) {
+        return [
+          { ...MODELS.qwen35_14b,      tag: "Fast" },
+          { ...MODELS.qwen3_30b_moe,   tag: "Recommended ⭐", recommended: true },
+          { ...MODELS.deepseek_r1_14b, tag: "Best Reasoning" },
         ];
       } else if (ramGB < 64) {
         return [
