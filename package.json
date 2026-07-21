@@ -2,21 +2,22 @@
   "name": "vnus-agent",
   "version": "1.0.0",
   "description": "Vnus AI Desktop Agent",
+  "author": "Vnus AI",
   "main": "src/main.js",
   "private": true,
   "scripts": {
-    "start":            "electron .",
-    "dev":              "electron . --dev",
-    "build":            "electron-builder",
-    "build:win":        "electron-builder --win",
-    "build:mac":        "electron-builder --mac",
-    "build:linux":      "electron-builder --linux",
-    "postinstall":      "electron-builder install-app-deps",
-    "install-browser":  "playwright install chromium --with-deps"
+    "start":           "electron .",
+    "dev":             "electron . --dev",
+    "build":           "electron-builder",
+    "build:win":       "electron-builder --win",
+    "build:mac":       "electron-builder --mac",
+    "build:linux":     "electron-builder --linux",
+    "postinstall":     "electron-builder install-app-deps",
+    "install-browser": "playwright install chromium --with-deps"
   },
   "dependencies": {
-    "playwright":       "^1.45.0",
-    "node-machine-id":  "^1.1.12"
+    "playwright":      "^1.45.0",
+    "node-machine-id": "^1.1.12"
   },
   "devDependencies": {
     "electron":         "^31.0.0",
@@ -26,8 +27,9 @@
     "appId":       "ai.vnus.agent",
     "productName": "Vnus Agent",
     "asar":        true,
+    "icon":        "assets/icon.png",
     "directories": {
-      "output":    "dist",
+      "output":         "dist",
       "buildResources": "assets"
     },
     "files": [
@@ -35,23 +37,15 @@
       "renderer/**/*",
       "assets/**/*",
       "node_modules/**/*",
-      "!node_modules/playwright/node_modules/**/*",
-      "!**/node_modules/*/{CHANGELOG.md,README.md,README,readme.md,readme}",
-      "!**/node_modules/*/{test,__tests__,tests,powered-test,example,examples}",
+      "!**/node_modules/*/{CHANGELOG.md,README.md,readme.md}",
+      "!**/node_modules/*/{test,__tests__,tests,example,examples}",
       "!**/node_modules/.bin"
-    ],
-    "extraResources": [
-      {
-        "from":   "node_modules/playwright",
-        "to":     "playwright",
-        "filter": ["**/*"]
-      }
     ],
     "win": {
       "target": [
         { "target": "nsis", "arch": ["x64"] }
       ],
-      "icon": "assets/icon.ico",
+      "icon": "assets/icon.png",
       "requestedExecutionLevel": "asInvoker",
       "artifactName": "VnusAgent-Setup-${version}.${ext}"
     },
@@ -59,13 +53,9 @@
       "target": [
         { "target": "dmg", "arch": ["x64", "arm64"] }
       ],
-      "icon":     "assets/icon.icns",
+      "icon":     "assets/icon.png",
       "category": "public.app-category.productivity",
-      "artifactName": "VnusAgent-${version}.${ext}",
-      "hardenedRuntime": true,
-      "gatekeeperAssess": false,
-      "entitlements": "assets/entitlements.mac.plist",
-      "entitlementsInherit": "assets/entitlements.mac.plist"
+      "artifactName": "VnusAgent-${version}.${ext}"
     },
     "linux": {
       "target": [
@@ -76,19 +66,17 @@
       "artifactName": "VnusAgent-${version}.${ext}"
     },
     "nsis": {
-      "oneClick":                          false,
-      "perMachine":                        false,
+      "oneClick":                           false,
+      "perMachine":                         false,
       "allowToChangeInstallationDirectory": true,
-      "installerIcon":                     "assets/icon.ico",
-      "uninstallerIcon":                   "assets/icon.ico",
-      "deleteAppDataOnUninstall":          true,
-      "createDesktopShortcut":             true,
-      "createStartMenuShortcut":           true,
-      "shortcutName":                      "Vnus Agent"
+      "deleteAppDataOnUninstall":           true,
+      "createDesktopShortcut":              true,
+      "createStartMenuShortcut":            true,
+      "shortcutName":                       "Vnus Agent"
     },
     "publish": {
-      "provider": "github",
-      "releaseType": "release"
+      "provider":     "github",
+      "releaseType":  "release"
     }
   }
 }
