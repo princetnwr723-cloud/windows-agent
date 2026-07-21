@@ -1,79 +1,94 @@
 {
   "name": "vnus-agent",
   "version": "1.0.0",
-  "description": "Vnus AI Agent — runs on your PC",
+  "description": "Vnus AI Desktop Agent",
   "main": "src/main.js",
-  "author": {
-    "name": "Vnus AI",
-    "email": "hello@vnus.ai"
-  },
-  "license": "UNLICENSED",
   "private": true,
   "scripts": {
-    "start": "electron .",
-    "dev": "electron . --dev",
-    "build:win": "electron-builder --win",
-    "build:mac": "electron-builder --mac",
-    "build:linux": "electron-builder --linux"
+    "start":            "electron .",
+    "dev":              "electron . --dev",
+    "build":            "electron-builder",
+    "build:win":        "electron-builder --win",
+    "build:mac":        "electron-builder --mac",
+    "build:linux":      "electron-builder --linux",
+    "postinstall":      "electron-builder install-app-deps",
+    "install-browser":  "playwright install chromium --with-deps"
   },
   "dependencies": {
-    "firebase": "^10.12.2",
-    "node-machine-id": "^1.1.12",
-    "os": "^0.1.2"
+    "playwright":       "^1.45.0",
+    "node-machine-id":  "^1.1.12"
   },
   "devDependencies": {
-    "electron": "^31.0.0",
+    "electron":         "^31.0.0",
     "electron-builder": "^24.13.3"
   },
   "build": {
-    "appId": "ai.vnus.agent",
+    "appId":       "ai.vnus.agent",
     "productName": "Vnus Agent",
-    "copyright": "Copyright 2026 Vnus AI",
-    "icon": "assets/icon.png",
+    "asar":        true,
+    "directories": {
+      "output":    "dist",
+      "buildResources": "assets"
+    },
+    "files": [
+      "src/**/*",
+      "renderer/**/*",
+      "assets/**/*",
+      "node_modules/**/*",
+      "!node_modules/playwright/node_modules/**/*",
+      "!**/node_modules/*/{CHANGELOG.md,README.md,README,readme.md,readme}",
+      "!**/node_modules/*/{test,__tests__,tests,powered-test,example,examples}",
+      "!**/node_modules/.bin"
+    ],
+    "extraResources": [
+      {
+        "from":   "node_modules/playwright",
+        "to":     "playwright",
+        "filter": ["**/*"]
+      }
+    ],
     "win": {
-      "target": [{ "target": "nsis", "arch": ["x64", "ia32"] }],
-      "icon": "assets/icon.png",
-      "requestedExecutionLevel": "requireAdministrator"
+      "target": [
+        { "target": "nsis", "arch": ["x64"] }
+      ],
+      "icon": "assets/icon.ico",
+      "requestedExecutionLevel": "asInvoker",
+      "artifactName": "VnusAgent-Setup-${version}.${ext}"
     },
     "mac": {
       "target": [
         { "target": "dmg", "arch": ["x64", "arm64"] }
       ],
-      "icon": "assets/icon.png",
+      "icon":     "assets/icon.icns",
       "category": "public.app-category.productivity",
-      "darkModeSupport": true,
+      "artifactName": "VnusAgent-${version}.${ext}",
+      "hardenedRuntime": true,
       "gatekeeperAssess": false,
-      "minimumSystemVersion": "10.13.0"
+      "entitlements": "assets/entitlements.mac.plist",
+      "entitlementsInherit": "assets/entitlements.mac.plist"
     },
     "linux": {
       "target": [
         { "target": "AppImage", "arch": ["x64"] }
       ],
-      "icon": "assets/icon.png",
-      "category": "Utility"
+      "icon":     "assets/icon.png",
+      "category": "Utility",
+      "artifactName": "VnusAgent-${version}.${ext}"
     },
     "nsis": {
-      "oneClick": false,
+      "oneClick":                          false,
+      "perMachine":                        false,
       "allowToChangeInstallationDirectory": true,
-      "createDesktopShortcut": true,
-      "createStartMenuShortcut": true,
-      "shortcutName": "Vnus Agent",
-      "include": "build/installer.nsh",
-      "warningsAsErrors": false
+      "installerIcon":                     "assets/icon.ico",
+      "uninstallerIcon":                   "assets/icon.ico",
+      "deleteAppDataOnUninstall":          true,
+      "createDesktopShortcut":             true,
+      "createStartMenuShortcut":           true,
+      "shortcutName":                      "Vnus Agent"
     },
-    "dmg": {
-      "title": "Vnus Agent",
-      "background": null,
-      "contents": [
-        { "x": 130, "y": 220, "type": "file" },
-        { "x": 410, "y": 220, "type": "link", "path": "/Applications" }
-      ],
-      "writeUpdateInfo": false,
-      "internetEnabled": false
-    },
-    "extraResources": [
-      { "from": "assets/", "to": "assets/", "filter": ["**/*"] }
-    ],
-    "publish": null
+    "publish": {
+      "provider": "github",
+      "releaseType": "release"
+    }
   }
 }
