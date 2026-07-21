@@ -1,17 +1,14 @@
-# .github/workflows/build.yml
-# Builds Vnus Agent for Windows, Mac, Linux automatically
-
 name: Build & Release
 
 on:
   push:
     tags:
-      - "v*"          # triggers on v1.0.0, v1.2.3 etc
-  workflow_dispatch:  # manual trigger from GitHub Actions tab
+      - "v*"
+  workflow_dispatch:
 
 jobs:
 
-  # ── Windows Build ──────────────────────────────────────
+  # ── Windows ──────────────────────────────────────────────
   build-windows:
     runs-on: windows-latest
     steps:
@@ -21,11 +18,10 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
-          cache: "npm"
+          node-version: "24"
 
       - name: Install dependencies
-        run: npm ci
+        run: npm install
 
       - name: Install Playwright Chromium
         run: npx playwright install chromium --with-deps
@@ -35,13 +31,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Upload Windows artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: windows-build
           path: dist/*.exe
 
-  # ── Mac Build ──────────────────────────────────────────
+  # ── Mac ──────────────────────────────────────────────────
   build-mac:
     runs-on: macos-latest
     steps:
@@ -51,11 +47,10 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
-          cache: "npm"
+          node-version: "24"
 
       - name: Install dependencies
-        run: npm ci
+        run: npm install
 
       - name: Install Playwright Chromium
         run: npx playwright install chromium --with-deps
@@ -65,13 +60,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Upload Mac artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: mac-build
           path: dist/*.dmg
 
-  # ── Linux Build ────────────────────────────────────────
+  # ── Linux ─────────────────────────────────────────────────
   build-linux:
     runs-on: ubuntu-latest
     steps:
@@ -81,16 +76,30 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
-          cache: "npm"
+          node-version: "24"
 
-      - name: Install Linux dependencies
+      - name: Install Linux system deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.0-dev libayatana-appindicator3-dev librsvg2-dev
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.0-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libnss3 \
+            libatk1.0-0 \
+            libatk-bridge2.0-0 \
+            libcups2 \
+            libxkbcommon0 \
+            libxcomposite1 \
+            libxdamage1 \
+            libxfixes3 \
+            libxrandr2 \
+            libgbm1 \
+            libasound2
 
       - name: Install dependencies
-        run: npm ci
+        run: npm install
 
       - name: Install Playwright Chromium
         run: npx playwright install chromium --with-deps
@@ -100,13 +109,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Upload Linux artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: linux-build
           path: dist/*.AppImage
 
-  # ── Create Release ─────────────────────────────────────
+  # ── Release ───────────────────────────────────────────────
   release:
     needs: [build-windows, build-mac, build-linux]
     runs-on: ubuntu-latest
@@ -115,7 +124,7 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
 
-      - name: Create Release
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
