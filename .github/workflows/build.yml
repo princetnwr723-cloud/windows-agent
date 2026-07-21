@@ -88,22 +88,25 @@ jobs:
       - name: Install Linux system deps
         run: |
           sudo apt-get update
+          # Ubuntu 24 Noble — updated package names
           sudo apt-get install -y \
             libgtk-3-dev \
-            libwebkit2gtk-4.0-dev \
+            libwebkit2gtk-4.1-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
             libnss3 \
-            libatk1.0-0 \
-            libatk-bridge2.0-0 \
-            libcups2 \
+            libatk1.0-0t64 \
+            libatk-bridge2.0-0t64 \
+            libcups2t64 \
             libxkbcommon0 \
             libxcomposite1 \
             libxdamage1 \
             libxfixes3 \
             libxrandr2 \
             libgbm1 \
-            libasound2
+            libasound2t64 \
+            libpango-1.0-0 \
+            libcairo2
 
       - name: Install dependencies
         run: npm install
@@ -122,7 +125,7 @@ jobs:
           name: linux-build
           path: dist/*.AppImage
 
-  # ── Release — sirf tag push pe ───────────────────────────
+  # ── Release — sirf NEW tag pe ────────────────────────────
   release:
     needs: [build-windows, build-mac, build-linux]
     runs-on: ubuntu-latest
@@ -141,5 +144,7 @@ jobs:
           generate_release_notes: true
           draft: false
           prerelease: false
+          # Overwrite existing release if same tag
+          fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
