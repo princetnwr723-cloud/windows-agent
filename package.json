@@ -1,8 +1,8 @@
 {
-  "name": "vnus-agent",
-  "version": "1.0.0",
-  "description": "Vnus AI Desktop Agent",
-  "author": "Vnus AI",
+  "name": "agentic-vnus",
+  "version": "1.0.1",
+  "description": "Agentic Vnus Desktop Agent",
+  "author": "Agentic Vnus",
   "main": "src/main.js",
   "private": true,
   "scripts": {
@@ -24,8 +24,8 @@
     "electron-builder": "^24.13.3"
   },
   "build": {
-    "appId":       "ai.vnus.agent",
-    "productName": "Vnus Agent",
+    "appId":       "ai.agentic.vnus",
+    "productName": "Agentic Vnus",
     "asar":        true,
     "icon":        "assets/icon.png",
     "directories": {
@@ -42,28 +42,22 @@
       "!**/node_modules/.bin"
     ],
     "win": {
-      "target": [
-        { "target": "nsis", "arch": ["x64"] }
-      ],
-      "icon": "assets/icon.png",
-      "requestedExecutionLevel": "asInvoker",
-      "artifactName": "VnusAgent-Setup-${version}.${ext}"
+      "target": [{ "target": "nsis", "arch": ["x64"] }],
+      "icon":   "assets/icon.png",
+      "requestedExecutionLevel": "requireAdministrator",
+      "artifactName": "AgenticVnus-Setup-${version}.${ext}"
     },
     "mac": {
-      "target": [
-        { "target": "dmg", "arch": ["x64", "arm64"] }
-      ],
-      "icon":     "assets/icon.png",
-      "category": "public.app-category.productivity",
-      "artifactName": "VnusAgent-${version}.${ext}"
+      "target": [{ "target": "dmg", "arch": ["x64", "arm64"] }],
+      "icon":       "assets/icon.png",
+      "category":   "public.app-category.productivity",
+      "artifactName": "AgenticVnus-${version}.${ext}"
     },
     "linux": {
-      "target": [
-        { "target": "AppImage", "arch": ["x64"] }
-      ],
-      "icon":     "assets/icon.png",
-      "category": "Utility",
-      "artifactName": "VnusAgent-${version}.${ext}"
+      "target": [{ "target": "AppImage", "arch": ["x64"] }],
+      "icon":       "assets/icon.png",
+      "category":   "Utility",
+      "artifactName": "AgenticVnus-${version}.${ext}"
     },
     "nsis": {
       "oneClick":                           false,
@@ -72,11 +66,12 @@
       "deleteAppDataOnUninstall":           true,
       "createDesktopShortcut":              true,
       "createStartMenuShortcut":            true,
-      "shortcutName":                       "Vnus Agent"
+      "shortcutName":                       "Agentic Vnus",
+      "include":                            "build/installer.nsh"
     },
     "publish": {
-      "provider":     "github",
-      "releaseType":  "release"
+      "provider":    "github",
+      "releaseType": "release"
     }
   }
 }
