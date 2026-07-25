@@ -13,10 +13,13 @@ function startCommandListener(workspaceId, firebaseConfig, modelConfig) {
   console.log(`   Vision    : ${modelConfig.visionEnabled ? "ON - " + modelConfig.visionOllamaId : "OFF"}`);
   console.log(`   Polling every ${POLL_INTERVAL / 1000}s...\n`);
 
+  // Track processing commands to avoid double execution
+  const processing = new Set();
+
   const poll = setInterval(async () => {
     try {
       const url = `${BASE}/agent_connections/${workspaceId}/commands?key=${API_KEY}`;
-      const res = await fetch(url);
+      const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
       if (!res.ok) return;
 
       const data = await res.json();
@@ -31,35 +34,50 @@ function startCommandListener(workspaceId, firebaseConfig, modelConfig) {
         const docId     = docSnap.name.split("/").pop();
 
         if (status !== "pending" || !command) continue;
+        if (processing.has(docId)) continue;
 
+        processing.add(docId);
         console.log(`\n🎯 Executing: "${command}"`);
+
+        // Mark as processing immediately
         await updateCommandStatus(workspaceId, docId, "processing", firebaseConfig);
 
-        try {
-          const result = await executeCommand(command, modelConfig);
+        // Execute in background
+        executeCommand(command, modelConfig)
+          .then(async (result) => {
+            if (chatId && messageId) {
+              await updateMessage(
+                workspaceId, chatId, messageId,
+                result.message || "Done!",
+                result.success ? "done" : "error",
+                result.screenshot,
+                firebaseConfig
+              );
+            }
+            await updateCommandStatus(workspaceId, docId, "completed", firebaseConfig);
 
-          if (chatId && messageId) {
-            await updateMessage(workspaceId, chatId, messageId,
-              result.message || "Done!", result.success ? "done" : "error",
-              result.screenshot, firebaseConfig);
-          }
-
-          await updateCommandStatus(workspaceId, docId, "completed", firebaseConfig);
-
-          if (result.screenshot) {
-            await saveScreenshot(workspaceId, result.screenshot, firebaseConfig);
-          }
-        } catch (err) {
-          console.error(`❌ Error: ${err.message}`);
-          if (chatId && messageId) {
-            await updateMessage(workspaceId, chatId, messageId,
-              `Failed: ${err.message}`, "error", null, firebaseConfig);
-          }
-          await updateCommandStatus(workspaceId, docId, "failed", firebaseConfig);
-        }
+            if (result.screenshot) {
+              await saveScreenshot(workspaceId, result.screenshot, firebaseConfig);
+            }
+          })
+          .catch(async (err) => {
+            console.error(`❌ Execute error: ${err.message}`);
+            if (chatId && messageId) {
+              await updateMessage(
+                workspaceId, chatId, messageId,
+                `Failed: ${err.message}`, "error", null, firebaseConfig
+              );
+            }
+            await updateCommandStatus(workspaceId, docId, "failed", firebaseConfig);
+          })
+          .finally(() => {
+            processing.delete(docId);
+          });
       }
     } catch (err) {
-      console.error(`❌ Listener error: ${err.message}`);
+      if (err.name !== "AbortError") {
+        console.error(`❌ Listener error: ${err.message}`);
+      }
     }
   }, POLL_INTERVAL);
 
@@ -67,11 +85,18 @@ function startCommandListener(workspaceId, firebaseConfig, modelConfig) {
 }
 
 async function updateCommandStatus(workspaceId, docId, status, firebaseConfig) {
-  const url = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/(default)/documents/agent_connections/${workspaceId}/commands/${docId}?key=${firebaseConfig.apiKey}&updateMask.fieldPaths=status`;
+  const url = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/(default)/documents/agent_connections/${workspaceId}/commands/${docId}?key=${firebaseConfig.apiKey}&updateMask.fieldPaths=status&updateMask.fieldPaths=updatedAt`;
   try {
     await fetch(url, {
-      method: "PATCH", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ fields: { status: { stringValue: status } } }),
+      method:  "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({
+        fields: {
+          status:    { stringValue: status },
+          updatedAt: { stringValue: new Date().toISOString() },
+        },
+      }),
+      signal: AbortSignal.timeout(5000),
     });
   } catch {}
 }
@@ -80,13 +105,16 @@ async function updateMessage(workspaceId, chatId, messageId, content, status, sc
   const url = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/(default)/documents/agent_connections/${workspaceId}/chats/${chatId}/messages/${messageId}?key=${firebaseConfig.apiKey}`;
   try {
     const fields = {
-      content: { stringValue: content },
-      status:  { stringValue: status },
+      content:   { stringValue: content },
+      status:    { stringValue: status },
+      updatedAt: { stringValue: new Date().toISOString() },
     };
     if (screenshot) fields.screenshot = { stringValue: screenshot };
     await fetch(url, {
-      method: "PATCH", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ fields }),
+      method:  "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({ fields }),
+      signal:  AbortSignal.timeout(5000),
     });
   } catch {}
 }
@@ -95,13 +123,15 @@ async function saveScreenshot(workspaceId, screenshot, firebaseConfig) {
   const url = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/(default)/documents/agent_connections/${workspaceId}/screenshots/latest?key=${firebaseConfig.apiKey}`;
   try {
     await fetch(url, {
-      method: "PATCH", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
+      method:  "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({
         fields: {
           data:    { stringValue: screenshot },
           takenAt: { stringValue: new Date().toISOString() },
         },
       }),
+      signal: AbortSignal.timeout(5000),
     });
   } catch {}
 }
