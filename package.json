@@ -10,7 +10,9 @@
     "dev":             "electron . --dev",
     "build":           "electron-builder",
     "build:win":       "electron-builder --win",
-    "build:mac":       "electron-builder --mac",
+    "build:mac":       "electron-builder --mac --x64",
+    "build:mac:arm":   "electron-builder --mac --arm64",
+    "build:mac:both":  "electron-builder --mac --x64 --arm64",
     "build:linux":     "electron-builder --linux",
     "postinstall":     "electron-builder install-app-deps",
     "install-browser": "playwright install chromium --with-deps"
@@ -42,21 +44,28 @@
       "!**/node_modules/.bin"
     ],
     "win": {
-      "target": [{ "target": "nsis", "arch": ["x64"] }],
-      "icon":   "assets/icon.png",
+      "target": [
+        { "target": "nsis", "arch": ["x64"] }
+      ],
+      "icon": "assets/icon.png",
       "requestedExecutionLevel": "requireAdministrator",
       "artifactName": "AgenticVnus-Setup-${version}.${ext}"
     },
     "mac": {
-      "target": [{ "target": "dmg", "arch": ["x64", "arm64"] }],
-      "icon":       "assets/icon.png",
-      "category":   "public.app-category.productivity",
-      "artifactName": "AgenticVnus-${version}.${ext}"
+      "target": [
+        { "target": "dmg", "arch": ["x64"] },
+        { "target": "dmg", "arch": ["arm64"] }
+      ],
+      "icon":     "assets/icon.png",
+      "category": "public.app-category.productivity",
+      "artifactName": "AgenticVnus-${version}-${arch}.${ext}"
     },
     "linux": {
-      "target": [{ "target": "AppImage", "arch": ["x64"] }],
-      "icon":       "assets/icon.png",
-      "category":   "Utility",
+      "target": [
+        { "target": "AppImage", "arch": ["x64"] }
+      ],
+      "icon":     "assets/icon.png",
+      "category": "Utility",
       "artifactName": "AgenticVnus-${version}.${ext}"
     },
     "nsis": {
