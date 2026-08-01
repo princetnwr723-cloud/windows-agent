@@ -1,213 +1,380 @@
 // src/agent/listener.js
-// ✅ Rate limiting — max 20 commands per minute per user
-// ✅ Command userId verification — sirf owner ke commands execute honge
-// ✅ Context pass to brain for permission system
+// ✅ Firebase Realtime Database — WebSocket persistent connection
+// ✅ Zero polling — server pushes instantly
+// ✅ Rate limiting + ownership verification
+// ✅ Skills sync to RTDB for workspace UI
 
 const { executeCommand, setAgentContext } = require("./brain");
+const { listSkills }                       = require("./skills");
+const { loadMemory }                       = require("./memory");
+const https                                = require("https");
+const http                                 = require("http");
 
-const POLL_INTERVAL = 3000;
-const MAX_PER_MIN   = 20;
-
-// ── Rate limiter ──────────────────────────────────────────
-const rateLimiter = new Map(); // userId → { count, resetAt }
+const MAX_PER_MIN  = 20;
+const rateLimiter  = new Map();
 
 function isRateLimited(userId) {
   if (!userId) return false;
   const now  = Date.now();
   const data = rateLimiter.get(userId) || { count: 0, resetAt: now + 60000 };
-
-  // Reset every minute
-  if (now > data.resetAt) {
-    data.count   = 0;
-    data.resetAt = now + 60000;
-  }
-
+  if (now > data.resetAt) { data.count = 0; data.resetAt = now + 60000; }
   data.count++;
   rateLimiter.set(userId, data);
+  return data.count > MAX_PER_MIN;
+}
 
-  if (data.count > MAX_PER_MIN) {
-    console.warn(`⚠️ Rate limited: ${userId} (${data.count} commands this minute)`);
-    return true;
+// ── RTDB REST helpers ─────────────────────────────────────
+function rtdbGet(rtdbUrl, path, apiKey) {
+  return new Promise((resolve, reject) => {
+    const url = `${rtdbUrl}${path}.json?auth=${apiKey}`;
+    const mod  = url.startsWith("https") ? https : http;
+    mod.get(url, (res) => {
+      let data = "";
+      res.on("data", c => data += c);
+      res.on("end", () => {
+        try { resolve(JSON.parse(data)); } catch { resolve(null); }
+      });
+    }).on("error", reject);
+  });
+}
+
+function rtdbSet(rtdbUrl, path, data, apiKey, method = "PUT") {
+  return new Promise((resolve, reject) => {
+    const body    = JSON.stringify(data);
+    const urlObj  = new URL(`${rtdbUrl}${path}.json?auth=${apiKey}`);
+    const options = {
+      hostname: urlObj.hostname,
+      path:     urlObj.pathname + urlObj.search,
+      method,
+      headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) },
+    };
+    const mod = urlObj.protocol === "https:" ? https : http;
+    const req = mod.request(options, (res) => {
+      let d = "";
+      res.on("data", c => d += c);
+      res.on("end", () => resolve(JSON.parse(d || "null")));
+    });
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+function rtdbPatch(rtdbUrl, path, data, apiKey) {
+  return rtdbSet(rtdbUrl, path, data, apiKey, "PATCH");
+}
+
+function rtdbDelete(rtdbUrl, path, apiKey) {
+  return new Promise((resolve, reject) => {
+    const urlObj  = new URL(`${rtdbUrl}${path}.json?auth=${apiKey}`);
+    const options = { hostname: urlObj.hostname, path: urlObj.pathname + urlObj.search, method: "DELETE" };
+    const mod = urlObj.protocol === "https:" ? https : http;
+    const req = mod.request(options, (res) => { res.on("data", () => {}); res.on("end", resolve); });
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+// ── Firebase Realtime Database SSE listener ───────────────
+// RTDB supports Server-Sent Events for real-time pushes
+function listenRTDB(rtdbUrl, path, apiKey, onData) {
+  const url     = `${rtdbUrl}${path}.json?auth=${apiKey}`;
+  const urlObj  = new URL(url);
+  const options = {
+    hostname: urlObj.hostname,
+    path:     urlObj.pathname + urlObj.search,
+    method:   "GET",
+    headers:  { "Accept": "text/event-stream", "Cache-Control": "no-cache" },
+  };
+
+  const mod = urlObj.protocol === "https:" ? https : http;
+  let req   = null;
+  let retry = 1000;
+
+  function connect() {
+    req = mod.request(options, (res) => {
+      retry = 1000; // reset backoff on successful connection
+      let buffer = "";
+
+      res.on("data", (chunk) => {
+        buffer += chunk.toString();
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        let event = null;
+        let dataStr = "";
+
+        for (const line of lines) {
+          if (line.startsWith("event: ")) {
+            event = line.slice(7).trim();
+          } else if (line.startsWith("data: ")) {
+            dataStr = line.slice(6).trim();
+          } else if (line === "" && event && dataStr) {
+            try {
+              const parsed = JSON.parse(dataStr);
+              onData(event, parsed);
+            } catch {}
+            event   = null;
+            dataStr = "";
+          }
+        }
+      });
+
+      res.on("end", () => {
+        console.warn("⚠️ RTDB connection closed — reconnecting...");
+        setTimeout(connect, retry);
+        retry = Math.min(retry * 2, 30000);
+      });
+
+      res.on("error", () => {
+        setTimeout(connect, retry);
+        retry = Math.min(retry * 2, 30000);
+      });
+    });
+
+    req.on("error", () => {
+      setTimeout(connect, retry);
+      retry = Math.min(retry * 2, 30000);
+    });
+
+    req.end();
   }
-  return false;
+
+  connect();
+  return () => { if (req) req.destroy(); };
 }
 
 // ── Main listener ─────────────────────────────────────────
 function startCommandListener(workspaceId, firebaseConfig, modelConfig) {
-  const BASE    = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/(default)/documents`;
-  const API_KEY = firebaseConfig.apiKey;
+  const { rtdbUrl, apiKey, projectId } = firebaseConfig;
 
-  console.log(`\n✅ Command listener started`);
+  if (!rtdbUrl) {
+    console.error("❌ RTDB URL not set in config — cannot start listener");
+    return null;
+  }
+
+  console.log(`\n✅ RTDB Listener started (WebSocket — zero polling)`);
   console.log(`   Workspace : ${workspaceId}`);
   console.log(`   Model     : ${modelConfig.ollamaId}`);
-  console.log(`   Vision    : ${modelConfig.visionEnabled ? "ON — " + modelConfig.visionOllamaId : "OFF"}`);
-  console.log(`   Rate limit: ${MAX_PER_MIN} commands/min`);
-  console.log(`   Polling every ${POLL_INTERVAL / 1000}s...\n`);
+  console.log(`   Vision    : ${modelConfig.visionEnabled ? "ON" : "OFF"}`);
 
-  // Set context for permission system
   setAgentContext(workspaceId, firebaseConfig, {});
 
-  // Get workspace owner ID upfront for verification
+  const processing = new Set();
   let workspaceOwnerId = null;
-  fetchWorkspaceOwner(BASE, API_KEY, workspaceId)
-    .then(id => {
-      workspaceOwnerId = id;
-      console.log(`✅ Workspace owner verified: ${workspaceOwnerId}`);
+
+  // Get workspace owner
+  rtdbGet(rtdbUrl, `/workspaces/${workspaceId}`, apiKey)
+    .then(data => {
+      workspaceOwnerId = data?.userId || null;
+      console.log(`✅ Owner verified: ${workspaceOwnerId}`);
+
+      // Set agent online status
+      rtdbPatch(rtdbUrl, `/workspaces/${workspaceId}`, {
+        agentOnline:    true,
+        agentLastSeen:  Date.now(),
+        agentModel:     modelConfig.ollamaId,
+        agentVision:    modelConfig.visionEnabled,
+      }, apiKey);
     })
     .catch(() => console.warn("⚠️ Could not fetch workspace owner"));
 
-  const processing = new Set();
+  // Sync skills to RTDB so workspace UI can show them
+  syncSkillsToRTDB(rtdbUrl, workspaceId, apiKey);
 
-  const poll = setInterval(async () => {
-    try {
-      const url = `${BASE}/agent_connections/${workspaceId}/commands?key=${API_KEY}`;
-      const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
-      if (!res.ok) return;
+  // Sync memory summary
+  syncMemoryToRTDB(rtdbUrl, workspaceId, apiKey);
 
-      const data = await res.json();
-      if (!data.documents?.length) return;
+  // ── Listen for new commands ─────────────────────────────
+  const stopCommands = listenRTDB(
+    rtdbUrl,
+    `/workspaces/${workspaceId}/commands`,
+    apiKey,
+    async (event, payload) => {
+      if (event !== "put" && event !== "patch") return;
 
-      for (const docSnap of data.documents) {
-        const fields    = docSnap.fields;
-        const status    = fields?.status?.stringValue;
-        const command   = fields?.command?.stringValue;
-        const chatId    = fields?.chatId?.stringValue;
-        const messageId = fields?.messageId?.stringValue;
-        const cmdUserId = fields?.userId?.stringValue;
-        const docId     = docSnap.name.split("/").pop();
+      const data = payload?.data;
+      if (!data || typeof data !== "object") return;
 
-        if (status !== "pending" || !command) continue;
-        if (processing.has(docId)) continue;
+      // payload.path is the command key or "/"
+      const commandPath = payload.path;
+      const commands    = commandPath === "/" ? data : { [commandPath.slice(1)]: data };
 
-        // ── Security Check 1: userId verification ─────────
+      for (const [cmdKey, cmdData] of Object.entries(commands || {})) {
+        if (!cmdData || cmdData.status !== "pending") continue;
+        if (processing.has(cmdKey)) continue;
+
+        const command   = cmdData.command;
+        const chatId    = cmdData.chatId;
+        const messageId = cmdData.messageId;
+        const cmdUserId = cmdData.userId;
+
+        if (!command) continue;
+
+        // Security: ownership check
         if (workspaceOwnerId && cmdUserId && cmdUserId !== workspaceOwnerId) {
-          console.error(`❌ Command from wrong user — rejecting: ${cmdUserId}`);
-          await updateCommandStatus(workspaceId, docId, "rejected", firebaseConfig);
+          console.error(`❌ Command from wrong user — rejecting`);
+          await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/commands/${cmdKey}/status`, "rejected", apiKey);
           continue;
         }
 
-        // ── Security Check 2: Rate limiting ───────────────
+        // Rate limit
         if (isRateLimited(cmdUserId || workspaceOwnerId)) {
-          console.warn(`⚠️ Rate limited — skipping command: "${command.slice(0, 40)}"`);
-          await updateCommandStatus(workspaceId, docId, "rate_limited", firebaseConfig);
-
-          // Notify user in chat
+          console.warn(`⚠️ Rate limited`);
+          await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/commands/${cmdKey}/status`, "rate_limited", apiKey);
           if (chatId && messageId) {
-            await updateMessage(
-              workspaceId, chatId, messageId,
-              "⚠️ Rate limit reached — max 20 commands per minute. Please wait a moment.",
-              "error", null, firebaseConfig
-            );
+            await updateMessage(rtdbUrl, workspaceId, chatId, messageId,
+              "⚠️ Too many commands — please wait a moment.", "error", null, apiKey);
           }
           continue;
         }
 
-        processing.add(docId);
-        console.log(`\n🎯 Executing: "${command}"`);
+        processing.add(cmdKey);
+        console.log(`\n🎯 Command received: "${command}"`);
 
-        // Update chat context for permissions
+        // Update context for permissions
         setAgentContext(workspaceId, firebaseConfig, { chatId, messageId });
 
-        await updateCommandStatus(workspaceId, docId, "processing", firebaseConfig);
+        // Mark processing
+        await rtdbPatch(rtdbUrl, `/workspaces/${workspaceId}/commands/${cmdKey}`, {
+          status:    "processing",
+          startedAt: Date.now(),
+        }, apiKey);
 
+        // Execute
         executeCommand(command, modelConfig)
           .then(async (result) => {
             if (chatId && messageId) {
-              await updateMessage(
-                workspaceId, chatId, messageId,
-                result.message || "Done!",
-                result.success ? "done" : "error",
-                result.screenshot,
-                firebaseConfig
-              );
+              await updateMessage(rtdbUrl, workspaceId, chatId, messageId,
+                result.message || "Done!", result.success ? "done" : "error",
+                result.screenshot, apiKey);
             }
-            await updateCommandStatus(workspaceId, docId, "completed", firebaseConfig);
+            await rtdbPatch(rtdbUrl, `/workspaces/${workspaceId}/commands/${cmdKey}`, {
+              status:      "completed",
+              completedAt: Date.now(),
+            }, apiKey);
+
             if (result.screenshot) {
-              await saveScreenshot(workspaceId, result.screenshot, firebaseConfig);
+              await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/liveView`, {
+                screenshot: result.screenshot,
+                takenAt:    Date.now(),
+              }, apiKey);
             }
+
+            // Re-sync skills after task (might have learned new ones)
+            syncSkillsToRTDB(rtdbUrl, workspaceId, apiKey);
           })
           .catch(async (err) => {
             console.error(`❌ Execute error: ${err.message}`);
             if (chatId && messageId) {
-              await updateMessage(
-                workspaceId, chatId, messageId,
-                `Failed: ${err.message}`, "error", null, firebaseConfig
-              );
+              await updateMessage(rtdbUrl, workspaceId, chatId, messageId,
+                `Failed: ${err.message}`, "error", null, apiKey);
             }
-            await updateCommandStatus(workspaceId, docId, "failed", firebaseConfig);
+            await rtdbPatch(rtdbUrl, `/workspaces/${workspaceId}/commands/${cmdKey}`, {
+              status: "failed",
+            }, apiKey);
           })
-          .finally(() => processing.delete(docId));
-      }
-    } catch (err) {
-      if (err.name !== "AbortError") {
-        console.error(`❌ Listener error: ${err.message}`);
+          .finally(() => {
+            processing.delete(cmdKey);
+            // Clean up old completed commands (keep last 50)
+            cleanOldCommands(rtdbUrl, workspaceId, apiKey);
+          });
       }
     }
-  }, POLL_INTERVAL);
+  );
 
-  return poll;
+  // ── Listen for screenshot requests ──────────────────────
+  const stopScreenshot = listenRTDB(
+    rtdbUrl,
+    `/workspaces/${workspaceId}/screenshotRequest`,
+    apiKey,
+    async (event, payload) => {
+      if (!payload?.data?.requested) return;
+      console.log("📸 Screenshot requested from workspace");
+      const { takeScreenshot } = require("./brain");
+      const shot = await takeScreenshot();
+      if (shot) {
+        await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/liveView`, {
+          screenshot: shot,
+          takenAt:    Date.now(),
+        }, apiKey);
+      }
+      // Clear request
+      await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/screenshotRequest`, null, apiKey);
+    }
+  );
+
+  // ── Heartbeat — keep agent online status ────────────────
+  const heartbeat = setInterval(async () => {
+    await rtdbPatch(rtdbUrl, `/workspaces/${workspaceId}`, {
+      agentOnline:   true,
+      agentLastSeen: Date.now(),
+    }, apiKey);
+  }, 30000); // every 30 seconds
+
+  // Return cleanup function
+  return () => {
+    stopCommands?.();
+    stopScreenshot?.();
+    clearInterval(heartbeat);
+    rtdbPatch(rtdbUrl, `/workspaces/${workspaceId}`, { agentOnline: false }, apiKey);
+  };
 }
 
-// ── Fetch workspace owner ─────────────────────────────────
-async function fetchWorkspaceOwner(BASE, API_KEY, workspaceId) {
+// ── Sync skills list to RTDB ──────────────────────────────
+async function syncSkillsToRTDB(rtdbUrl, workspaceId, apiKey) {
   try {
-    const res  = await fetch(`${BASE}/agent_connections/${workspaceId}?key=${API_KEY}`, { signal: AbortSignal.timeout(5000) });
-    const data = await res.json();
-    return data?.fields?.userId?.stringValue || null;
-  } catch { return null; }
-}
-
-// ── Firestore helpers ─────────────────────────────────────
-async function updateCommandStatus(workspaceId, docId, status, firebaseConfig) {
-  const url = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/(default)/documents/agent_connections/${workspaceId}/commands/${docId}?key=${firebaseConfig.apiKey}&updateMask.fieldPaths=status&updateMask.fieldPaths=updatedAt`;
-  try {
-    await fetch(url, {
-      method:  "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body:    JSON.stringify({
-        fields: {
-          status:    { stringValue: status },
-          updatedAt: { stringValue: new Date().toISOString() },
-        },
-      }),
-      signal: AbortSignal.timeout(5000),
-    });
+    const skills = listSkills();
+    const slim   = skills.slice(0, 20).map(s => ({
+      id:           s.id,
+      name:         s.name,
+      description:  s.description,
+      trigger:      s.trigger,
+      category:     s.category,
+      successCount: s.successCount || 0,
+      lastUsed:     s.lastUsed,
+    }));
+    await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/skills`, slim, apiKey);
   } catch {}
 }
 
-async function updateMessage(workspaceId, chatId, messageId, content, status, screenshot, firebaseConfig) {
-  const url = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/(default)/documents/agent_connections/${workspaceId}/chats/${chatId}/messages/${messageId}?key=${firebaseConfig.apiKey}`;
+// ── Sync memory summary to RTDB ───────────────────────────
+async function syncMemoryToRTDB(rtdbUrl, workspaceId, apiKey) {
   try {
-    const fields = {
-      content:   { stringValue: content },
-      status:    { stringValue: status },
-      updatedAt: { stringValue: new Date().toISOString() },
-    };
-    if (screenshot) fields.screenshot = { stringValue: screenshot };
-    await fetch(url, {
-      method:  "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body:    JSON.stringify({ fields }),
-      signal:  AbortSignal.timeout(5000),
-    });
+    const mem = loadMemory();
+    await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/memorySummary`, {
+      totalTasks:  mem.agent?.totalTasksCompleted || 0,
+      sessions:    mem.sessionCount || 0,
+      factsCount:  (mem.facts || []).length,
+      skillsCount: 0,
+      userName:    mem.user?.name || null,
+      updatedAt:   Date.now(),
+    }, apiKey);
   } catch {}
 }
 
-async function saveScreenshot(workspaceId, screenshot, firebaseConfig) {
-  const url = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/(default)/documents/agent_connections/${workspaceId}/screenshots/latest?key=${firebaseConfig.apiKey}`;
+// ── Update message in RTDB ────────────────────────────────
+async function updateMessage(rtdbUrl, workspaceId, chatId, messageId, content, status, screenshot, apiKey) {
+  const update = { content, status, updatedAt: Date.now() };
+  if (screenshot) update.screenshot = screenshot;
+  await rtdbPatch(rtdbUrl, `/workspaces/${workspaceId}/chats/${chatId}/messages/${messageId}`, update, apiKey);
+}
+
+// ── Clean old commands ────────────────────────────────────
+async function cleanOldCommands(rtdbUrl, workspaceId, apiKey) {
   try {
-    await fetch(url, {
-      method:  "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body:    JSON.stringify({
-        fields: {
-          data:    { stringValue: screenshot },
-          takenAt: { stringValue: new Date().toISOString() },
-        },
-      }),
-      signal: AbortSignal.timeout(5000),
-    });
+    const cmds = await rtdbGet(rtdbUrl, `/workspaces/${workspaceId}/commands`, apiKey);
+    if (!cmds) return;
+    const entries = Object.entries(cmds)
+      .filter(([, v]) => v.status === "completed" || v.status === "failed")
+      .sort(([, a], [, b]) => (a.completedAt || 0) - (b.completedAt || 0));
+    if (entries.length > 50) {
+      const toDelete = entries.slice(0, entries.length - 50);
+      for (const [key] of toDelete) {
+        await rtdbDelete(rtdbUrl, `/workspaces/${workspaceId}/commands/${key}`, apiKey);
+      }
+    }
   } catch {}
 }
 
-module.exports = { startCommandListener };
+module.exports = { startCommandListener, rtdbSet, rtdbGet, rtdbPatch, rtdbDelete, syncSkillsToRTDB };
