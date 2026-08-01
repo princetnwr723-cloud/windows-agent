@@ -1,39 +1,38 @@
-// src/main.js — Agentic Vnus Desktop Agent
-// Flow: Install → Splash+Code → Website Connect → Plan → Model Download → Workspace
-
+// src/main.js — Complete with RTDB + Auto-updater + Scheduler
 const {
   app, BrowserWindow, Tray, Menu, nativeImage,
-  shell, dialog, ipcMain, screen, systemPreferences,
+  shell, dialog, ipcMain, screen,
 } = require("electron");
-const path         = require("path");
-const os           = require("os");
-const fs           = require("fs");
-const { execSync } = require("child_process");
+const { autoUpdater } = require("electron-updater");
+const path            = require("path");
+const os              = require("os");
+const fs              = require("fs");
 
 const { firebaseConfig }        = require("./config");
 const { startCommandListener }  = require("./agent/listener");
+const { startScheduler }        = require("./agent/scheduler");
 const { getPCSpecs }            = require("./agent/specs");
 const { getModelOptions }       = require("./agent/modelSelector");
 const { setupModel, isOllamaRunning, startOllama } = require("./agent/ollamaManager");
 const { generatePermanentCode } = require("./agent/machineCode");
+const { initMemory }            = require("./agent/memory");
 
-// ── Config ────────────────────────────────────────────────
 const PLATFORM   = os.platform();
 const DATA_DIR   = path.join(app.getPath("userData"), "agentic-vnus");
 const STATE_FILE = path.join(DATA_DIR, "state.json");
-const WEBSITE    = "https://agentic-vnus.vercel.app"; // production URL
+const WEBSITE    = "https://agenticvnus.com";
+const RTDB_URL   = firebaseConfig.rtdbUrl;
 
 let tray            = null;
 let splashWindow    = null;
 let workspaceWindow = null;
 let isQuitting      = false;
-let commandListener = null;
+let listenerCleanup = null;
 
 // ── State helpers ─────────────────────────────────────────
 function ensureDataDir() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 }
-
 function loadState() {
   ensureDataDir();
   try {
@@ -41,21 +40,15 @@ function loadState() {
       return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
   } catch {}
   return {
-    isSetup:          false,
-    agentCode:        null,
-    userId:           null,
-    plan:             null,      // null = plan not chosen yet
-    planVerified:     false,     // true = Gumroad payment confirmed
-    selectedModel:    null,
-    modelReady:       false,
+    isSetup: false, agentCode: null, userId: null,
+    plan: null, planVerified: false,
+    selectedModel: null, modelReady: false,
     userDisconnected: false,
   };
 }
-
 function saveState(updates) {
   ensureDataDir();
-  const current = loadState();
-  const next    = { ...current, ...updates };
+  const next = { ...loadState(), ...updates };
   fs.writeFileSync(STATE_FILE, JSON.stringify(next, null, 2));
   return next;
 }
@@ -63,331 +56,211 @@ function saveState(updates) {
 // ── PC Info ───────────────────────────────────────────────
 function getPCInfo() {
   return {
-    pcName:      os.hostname(),
-    os:          `${getOSName()} ${os.release()}`,
-    platform:    PLATFORM,
-    arch:        os.arch(),
-    username:    os.userInfo().username,
+    pcName: os.hostname(), os: getOSName() + " " + os.release(),
+    platform: PLATFORM, arch: os.arch(),
+    username: os.userInfo().username,
     totalMemory: Math.round(os.totalmem() / (1024 ** 3)) + " GB",
   };
 }
-
 function getOSName() {
   if (PLATFORM === "win32")  return "Windows";
   if (PLATFORM === "darwin") return "macOS";
   return "Linux";
 }
 
-// ── Firestore REST helpers ────────────────────────────────
-const FS_BASE = () =>
-  `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/(default)/documents`;
+// ── RTDB helpers ──────────────────────────────────────────
+const { rtdbSet, rtdbGet, rtdbPatch, rtdbDelete } = require("./agent/listener");
 
-async function firestoreGet(path) {
-  try {
-    const res  = await fetch(`${FS_BASE()}/${path}?key=${firebaseConfig.apiKey}`);
-    const data = await res.json();
-    return data?.fields || null;
-  } catch { return null; }
+async function rtdbRegisterAgent(code, pcInfo) {
+  await rtdbSet(RTDB_URL, `/workspaces/${code}`, {
+    code, userId: null, userDisconnected: false,
+    status: "waiting", agentOnline: true,
+    pcName: pcInfo.pcName, os: pcInfo.os,
+    platform: pcInfo.platform, username: pcInfo.username,
+    totalMemory: pcInfo.totalMemory,
+    registeredAt: Date.now(),
+  }, firebaseConfig.apiKey);
 }
 
-async function firestorePatch(path, fields, maskFields = null) {
-  try {
-    let url = `${FS_BASE()}/${path}?key=${firebaseConfig.apiKey}`;
-    if (maskFields) {
-      url += maskFields.map(f => `&updateMask.fieldPaths=${f}`).join("");
+async function listenForConnection(code, onConnected, onDisconnected) {
+  const { listenRTDB } = require("./agent/listener");
+  listenRTDB(RTDB_URL, `/workspaces/${code}`, firebaseConfig.apiKey, (event, payload) => {
+    const data = payload?.data;
+    if (!data) return;
+    const status          = data.status;
+    const userId          = data.userId;
+    const userDisconnected = data.userDisconnected;
+    const plan            = data.plan;
+
+    if (userDisconnected && status === "disconnected") {
+      onDisconnected?.();
+    } else if (status === "connected" && userId && !userDisconnected) {
+      onConnected(userId, plan);
     }
-    const firestoreFields = {};
-    for (const [k, v] of Object.entries(fields)) {
-      if (typeof v === "string")  firestoreFields[k] = { stringValue: v };
-      if (typeof v === "boolean") firestoreFields[k] = { booleanValue: v };
-      if (v === null)             firestoreFields[k] = { nullValue: null };
+  });
+}
+
+async function listenForPlanVerification(userId, onVerified) {
+  const { listenRTDB } = require("./agent/listener");
+  listenRTDB(RTDB_URL, `/users/${userId}`, firebaseConfig.apiKey, (event, payload) => {
+    const data = payload?.data;
+    if (!data) return;
+    const plan         = data.plan;
+    const planVerified = data.planVerified;
+    if (plan && (planVerified === true || plan === "free")) {
+      onVerified(plan);
     }
-    const res = await fetch(url, {
-      method:  "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body:    JSON.stringify({ fields: firestoreFields }),
+  });
+}
+
+// ── Auto Updater ──────────────────────────────────────────
+function setupAutoUpdater() {
+  autoUpdater.autoDownload    = true;
+  autoUpdater.autoInstallOnAppQuit = true;
+
+  autoUpdater.on("checking-for-update", () => {
+    console.log("🔍 Checking for updates...");
+  });
+
+  autoUpdater.on("update-available", (info) => {
+    console.log(`📦 Update available: v${info.version}`);
+    tray?.setToolTip(`Agentic Vnus — Downloading update v${info.version}...`);
+    sendToSplash("update-status", { status: "downloading", version: info.version });
+  });
+
+  autoUpdater.on("update-not-available", () => {
+    console.log("✅ App is up to date");
+  });
+
+  autoUpdater.on("download-progress", (progress) => {
+    const pct = Math.round(progress.percent);
+    console.log(`📥 Update download: ${pct}%`);
+    tray?.setToolTip(`Agentic Vnus — Update ${pct}%`);
+  });
+
+  autoUpdater.on("update-downloaded", (info) => {
+    console.log(`✅ Update downloaded: v${info.version}`);
+    tray?.setToolTip("Agentic Vnus — Update ready");
+
+    dialog.showMessageBox({
+      type:      "info",
+      title:     "Update Ready — Agentic Vnus",
+      message:   `v${info.version} is ready to install`,
+      detail:    "The update has been downloaded. Restart now to apply it — takes less than 30 seconds.",
+      buttons:   ["Restart & Install", "Later"],
+      defaultId: 0,
+      icon:      path.join(__dirname, "../assets/icon.png"),
+    }).then(result => {
+      if (result.response === 0) {
+        isQuitting = true;
+        autoUpdater.quitAndInstall();
+      }
     });
-    return res.ok;
-  } catch { return false; }
-}
-
-// ── Save agent code to Firestore ──────────────────────────
-async function registerAgent(code, pcInfo) {
-  return firestorePatch(`agent_connections/${code}`, {
-    code,
-    status:           "waiting",
-    userId:           null,
-    userDisconnected: false,
-    pcName:           pcInfo.pcName,
-    os:               pcInfo.os,
-    platform:         pcInfo.platform,
-    arch:             pcInfo.arch,
-    username:         pcInfo.username,
-    createdAt:        new Date().toISOString(),
-    permanent:        "true",
   });
-}
 
-// ── Poll for connection ───────────────────────────────────
-function listenForConnection(code, onConnected, onDisconnected) {
-  const poll = setInterval(async () => {
-    try {
-      const fields          = await firestoreGet(`agent_connections/${code}`);
-      if (!fields) return;
-      const status          = fields?.status?.stringValue;
-      const userId          = fields?.userId?.stringValue;
-      const userDisconnected = fields?.userDisconnected?.booleanValue;
-      const plan            = fields?.plan?.stringValue;
-
-      if (userDisconnected && status === "disconnected") {
-        clearInterval(poll);
-        onDisconnected?.();
-        return;
-      }
-      if (status === "connected" && userId && !userDisconnected) {
-        clearInterval(poll);
-        onConnected(userId, plan);
-      }
-    } catch {}
-  }, 3000);
-  return poll;
-}
-
-// ── Poll for plan verification (after Gumroad payment) ────
-function listenForPlanVerification(userId, onVerified) {
-  const poll = setInterval(async () => {
-    try {
-      const fields = await firestoreGet(`users/${userId}`);
-      if (!fields) return;
-      const plan         = fields?.plan?.stringValue;
-      const planVerified = fields?.planVerified?.booleanValue;
-
-      // Plan set hua matlab webhook aa gaya ya free plan choose kiya
-      if (plan && (planVerified === true || plan === "free")) {
-        clearInterval(poll);
-        onVerified(plan);
-      }
-    } catch {}
-  }, 3000);
-  return poll;
-}
-
-// ── Fetch user plan from Firebase ─────────────────────────
-async function fetchUserPlan(userId) {
-  const fields = await firestoreGet(`users/${userId}`);
-  return fields?.plan?.stringValue || null;
-}
-
-// ── Startup setup ─────────────────────────────────────────
-function addToStartup() {
-  try {
-    const exePath = app.getPath("exe");
-    if (PLATFORM === "win32") {
-      execSync(
-        `reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" /v "AgenticVnus" /t REG_SZ /d "${exePath}" /f`,
-        { stdio: "pipe" }
-      );
-    } else if (PLATFORM === "darwin") {
-      const launchDir  = path.join(os.homedir(), "Library", "LaunchAgents");
-      const plistPath  = path.join(launchDir, "ai.agentic.vnus.plist");
-      if (!fs.existsSync(launchDir)) fs.mkdirSync(launchDir, { recursive: true });
-      fs.writeFileSync(plistPath, `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>ai.agentic.vnus</string>
-  <key>ProgramArguments</key><array><string>${exePath}</string></array>
-  <key>RunAtLoad</key><true/><key>KeepAlive</key><false/>
-</dict></plist>`);
-      execSync(`launchctl load "${plistPath}"`, { stdio: "pipe" });
-    } else {
-      const autostartDir = path.join(os.homedir(), ".config", "autostart");
-      if (!fs.existsSync(autostartDir)) fs.mkdirSync(autostartDir, { recursive: true });
-      fs.writeFileSync(
-        path.join(autostartDir, "agentic-vnus.desktop"),
-        `[Desktop Entry]\nType=Application\nName=Agentic Vnus\nExec=${exePath}\nHidden=false\nNoDisplay=false\nX-GNOME-Autostart-enabled=true`
-      );
-    }
-  } catch (err) {
-    console.error("Startup setup error:", err.message);
-  }
-}
-
-// ── Splash Window ─────────────────────────────────────────
-function createSplashWindow() {
-  if (splashWindow && !splashWindow.isDestroyed()) {
-    splashWindow.focus();
-    return;
-  }
-  const { width, height } = screen.getPrimaryDisplay().workAreaSize;
-  splashWindow = new BrowserWindow({
-    width: 480, height: 700,
-    x: Math.round((width - 480) / 2),
-    y: Math.round((height - 700) / 2),
-    frame:     false,
-    resizable: false,
-    alwaysOnTop: true,
-    webPreferences: {
-      nodeIntegration:  false,
-      contextIsolation: true,
-      preload: path.join(__dirname, "preload.js"),
-    },
-    backgroundColor: "#050505",
-    show: false,
-    ...(PLATFORM === "darwin" ? { vibrancy: "dark", visualEffectState: "active" } : {}),
+  autoUpdater.on("error", (err) => {
+    console.error("❌ Auto-update error:", err.message);
   });
-  splashWindow.loadFile(path.join(__dirname, "../renderer/splash.html"));
-  splashWindow.once("ready-to-show", () => {
-    if (splashWindow && !splashWindow.isDestroyed()) splashWindow.show();
-  });
-  splashWindow.on("closed", () => { splashWindow = null; });
+
+  // Check on startup, then every 4 hours
+  setTimeout(() => autoUpdater.checkForUpdates(), 10000);
+  setInterval(() => autoUpdater.checkForUpdates(), 4 * 60 * 60 * 1000);
 }
 
+// ── Splash helpers ────────────────────────────────────────
 function sendToSplash(event, data) {
   if (splashWindow && !splashWindow.isDestroyed()) {
     splashWindow.webContents.send(event, data);
   }
 }
 
+// ── Splash Window ─────────────────────────────────────────
+function createSplashWindow() {
+  if (splashWindow && !splashWindow.isDestroyed()) { splashWindow.focus(); return; }
+  const { width, height } = screen.getPrimaryDisplay().workAreaSize;
+  splashWindow = new BrowserWindow({
+    width: 480, height: 700,
+    x: Math.round((width - 480) / 2), y: Math.round((height - 700) / 2),
+    frame: false, resizable: false, alwaysOnTop: true,
+    webPreferences: { nodeIntegration: false, contextIsolation: true, preload: path.join(__dirname, "preload.js") },
+    backgroundColor: "#050505", show: false,
+  });
+  splashWindow.loadFile(path.join(__dirname, "../renderer/splash.html"));
+  splashWindow.once("ready-to-show", () => splashWindow?.show());
+  splashWindow.on("closed", () => { splashWindow = null; });
+}
+
 // ── Workspace Window ──────────────────────────────────────
 function createWorkspaceWindow(code) {
-  if (workspaceWindow && !workspaceWindow.isDestroyed()) {
-    workspaceWindow.focus();
-    return;
-  }
+  if (workspaceWindow && !workspaceWindow.isDestroyed()) { workspaceWindow.focus(); return; }
   const { width, height } = screen.getPrimaryDisplay().workAreaSize;
   workspaceWindow = new BrowserWindow({
-    width:  Math.min(1200, width  - 40),
-    height: Math.min(800,  height - 40),
-    x: Math.round((width  - Math.min(1200, width  - 40)) / 2),
-    y: Math.round((height - Math.min(800,  height - 40)) / 2),
-    frame:     true,
-    resizable: true,
-    title:     "Agentic Vnus — Workspace",
-    webPreferences: {
-      nodeIntegration:  false,
-      contextIsolation: true,
-      preload: path.join(__dirname, "preload.js"),
-    },
-    backgroundColor: "#050505",
-    show: false,
-    ...(PLATFORM === "darwin" ? { titleBarStyle: "hiddenInset", vibrancy: "dark" } : {}),
+    width: Math.min(1200, width - 40), height: Math.min(800, height - 40),
+    x: Math.round((width - Math.min(1200, width - 40)) / 2),
+    y: Math.round((height - Math.min(800, height - 40)) / 2),
+    frame: true, resizable: true, title: "Agentic Vnus",
+    webPreferences: { nodeIntegration: false, contextIsolation: true, preload: path.join(__dirname, "preload.js") },
+    backgroundColor: "#050505", show: false,
   });
-
-  const workspaceUrl = `${WEBSITE}/dashboard/workspace/${code}?agent=true`;
-  workspaceWindow.loadURL(workspaceUrl);
-
+  workspaceWindow.loadURL(`${WEBSITE}/dashboard/workspace/${code}?agent=true`);
   workspaceWindow.once("ready-to-show", () => {
-    if (workspaceWindow && !workspaceWindow.isDestroyed()) {
-      workspaceWindow.show();
-      // Splash band karo jab workspace khule
-      if (splashWindow && !splashWindow.isDestroyed()) splashWindow.close();
-    }
+    workspaceWindow?.show();
+    if (splashWindow && !splashWindow.isDestroyed()) splashWindow.close();
   });
-
-  workspaceWindow.on("closed", () => { workspaceWindow = null; });
-
   workspaceWindow.webContents.on("did-finish-load", () => {
-    if (workspaceWindow && !workspaceWindow.isDestroyed()) {
-      const st = loadState();
-      workspaceWindow.webContents.executeJavaScript(`
-        window.__VNUS_AGENT__    = true;
-        window.__WORKSPACE_ID__  = "${code}";
-        window.__PLAN__          = "${st.plan || "free"}";
-      `);
-    }
+    const st = loadState();
+    workspaceWindow?.webContents.executeJavaScript(`
+      window.__VNUS_AGENT__   = true;
+      window.__WORKSPACE_ID__ = "${code}";
+      window.__PLAN__         = "${st.plan || "free"}";
+    `);
   });
+  workspaceWindow.on("closed", () => { workspaceWindow = null; });
 }
 
 // ── Tray ──────────────────────────────────────────────────
 function createTray() {
   const iconPath = path.join(__dirname, "../assets/tray-icon.png");
   let icon;
-  try {
-    icon = nativeImage.createFromPath(iconPath).resize({ width: 16, height: 16 });
-  } catch {
-    icon = nativeImage.createEmpty();
-  }
-
+  try { icon = nativeImage.createFromPath(iconPath).resize({ width: 16, height: 16 }); }
+  catch { icon = nativeImage.createEmpty(); }
   tray = new Tray(icon);
-  tray.setToolTip("Agentic Vnus — Running");
+  tray.setToolTip("Agentic Vnus");
 
   const updateMenu = (connected = false) => {
     const st = loadState();
-    const menu = Menu.buildFromTemplate([
+    tray.setContextMenu(Menu.buildFromTemplate([
       { label: "Agentic Vnus", enabled: false },
       { type: "separator" },
-      { label: connected ? "● Connected" : "○ Not connected", enabled: false },
+      { label: connected ? "● Connected" : "○ Waiting...", enabled: false },
       { type: "separator" },
-      {
-        label:   "Open Workspace",
-        enabled: connected && st.modelReady,
-        click:   () => createWorkspaceWindow(st.agentCode),
-      },
-      {
-        label: "Open Website",
-        click: () => shell.openExternal(WEBSITE),
-      },
-      {
-        label: "Show Agent Code",
-        click: () => {
-          createSplashWindow();
-          setTimeout(() => sendToSplash("agent-data", {
-            code:      st.agentCode,
-            pcName:    os.hostname(),
-            os:        getOSName(),
-            connected,
-            plan:      st.plan,
-          }), 500);
-        },
-      },
+      { label: "Open Workspace", enabled: connected && st.modelReady, click: () => createWorkspaceWindow(st.agentCode) },
+      { label: "Open Website",   click: () => shell.openExternal(WEBSITE) },
+      { type: "separator" },
+      { label: "Check for Updates", click: () => autoUpdater.checkForUpdates() },
       { type: "separator" },
       { label: "Quit", click: () => { isQuitting = true; app.quit(); } },
-    ]);
-    tray.setContextMenu(menu);
+    ]));
   };
 
   tray.on("double-click", () => {
     const st = loadState();
-    if (st.userId && st.modelReady && !st.userDisconnected) {
-      createWorkspaceWindow(st.agentCode);
-    } else {
-      createSplashWindow();
-    }
+    if (st.userId && st.modelReady && !st.userDisconnected) createWorkspaceWindow(st.agentCode);
+    else createSplashWindow();
   });
 
   return updateMenu;
 }
 
-// ── IPC Handlers ──────────────────────────────────────────
-ipcMain.on("close-splash", () => {
-  if (splashWindow && !splashWindow.isDestroyed()) splashWindow.close();
-});
+// ── IPC ───────────────────────────────────────────────────
+ipcMain.on("close-splash",   () => splashWindow?.close());
+ipcMain.on("open-dashboard", () => shell.openExternal(`${WEBSITE}/dashboard`));
+ipcMain.on("open-workspace", () => { const st = loadState(); if (st.agentCode) createWorkspaceWindow(st.agentCode); });
 
-ipcMain.on("open-dashboard", () => {
-  shell.openExternal(`${WEBSITE}/dashboard`);
-});
-
-ipcMain.on("open-workspace", () => {
-  const st = loadState();
-  if (st.agentCode) createWorkspaceWindow(st.agentCode);
-});
-
-// Model selected → download karo
 ipcMain.on("model-selected", async (event, { modelOption, visionEnabled, visionModel }) => {
-  const st = loadState();
-
-  saveState({
-    selectedModel: {
-      ollamaId:       modelOption.ollamaId,
-      name:           modelOption.name,
-      visionEnabled,
-      visionOllamaId: visionEnabled && visionModel ? visionModel.ollamaId : null,
-    },
-  });
-
+  saveState({ selectedModel: { ollamaId: modelOption.ollamaId, name: modelOption.name, visionEnabled, visionOllamaId: visionEnabled && visionModel ? visionModel.ollamaId : null } });
   sendToSplash("setup-progress", { step: "starting", message: "Starting AI engine...", percent: 5 });
 
-  // Ollama start karo pehle
   const running = await isOllamaRunning();
   if (!running) {
     sendToSplash("setup-progress", { step: "ollama", message: "Starting Ollama...", percent: 10 });
@@ -395,281 +268,169 @@ ipcMain.on("model-selected", async (event, { modelOption, visionEnabled, visionM
     await new Promise(r => setTimeout(r, 3000));
   }
 
-  const modelsToSetup = [modelOption.ollamaId];
-  if (visionEnabled && visionModel) modelsToSetup.push(visionModel.ollamaId);
+  const models = [modelOption.ollamaId];
+  if (visionEnabled && visionModel) models.push(visionModel.ollamaId);
+  let allOk = true;
 
-  let allSuccess = true;
-
-  for (let i = 0; i < modelsToSetup.length; i++) {
-    const modelId     = modelsToSetup[i];
-    const basePercent = i === 0 ? 15 : 65;
-    const result      = await setupModel(modelId, (progress) => {
-      const pct = basePercent + Math.round((progress.percent || 0) * (i === 0 ? 0.5 : 0.35));
-      sendToSplash("setup-progress", { ...progress, percent: Math.min(pct, 99) });
+  for (let i = 0; i < models.length; i++) {
+    const result = await setupModel(models[i], (p) => {
+      const pct = (i === 0 ? 15 : 65) + Math.round((p.percent || 0) * (i === 0 ? 0.5 : 0.35));
+      sendToSplash("setup-progress", { ...p, percent: Math.min(pct, 99) });
     });
-
     if (!result.success) {
-      allSuccess = false;
-      sendToSplash("setup-error", {
-        message: result.error || `Failed to download ${modelId}. Check your internet connection and try again.`,
-        modelId,
-      });
-      // State reset karo taaki retry possible ho
+      allOk = false;
+      sendToSplash("setup-error", { message: result.error || `Failed to download ${models[i]}` });
       saveState({ modelReady: false, selectedModel: null });
       return;
     }
   }
 
-  if (allSuccess) {
+  if (allOk) {
     saveState({ modelReady: true });
     sendToSplash("setup-progress", { step: "done", message: "AI ready!", percent: 100 });
     setTimeout(() => {
       sendToSplash("model-ready");
-      // Workspace kholo
-      const finalState = loadState();
-      if (finalState.userId) {
-        setTimeout(() => createWorkspaceWindow(finalState.agentCode), 1500);
+      const st = loadState();
+      if (st.userId) {
+        startFullAgent(st.agentCode, st.selectedModel);
+        setTimeout(() => createWorkspaceWindow(st.agentCode), 1500);
       }
     }, 800);
   }
 });
 
-// Retry download
 ipcMain.on("retry-model-download", () => {
   const st = loadState();
   if (st.plan && st.userId) {
-    const specs        = getPCSpecs();
-    const modelOptions = getModelOptions(st.plan, specs);
-    sendToSplash("show-model-picker", { specs, modelOptions, plan: st.plan });
+    const specs = getPCSpecs();
+    sendToSplash("show-model-picker", { specs, modelOptions: getModelOptions(st.plan, specs), plan: st.plan });
   }
 });
 
+// ── Start full agent (listener + scheduler) ───────────────
+function startFullAgent(code, selectedModel) {
+  if (!selectedModel) return;
+  const modelConfig = {
+    ollamaId:       selectedModel.ollamaId,
+    visionEnabled:  selectedModel.visionEnabled || false,
+    visionOllamaId: selectedModel.visionOllamaId || null,
+  };
+
+  // Start RTDB command listener
+  if (listenerCleanup) listenerCleanup();
+  listenerCleanup = startCommandListener(code, firebaseConfig, modelConfig);
+
+  // Start scheduler
+  startScheduler(code, firebaseConfig, modelConfig);
+
+  console.log("🚀 Full agent started — Listener + Scheduler running");
+}
+
 // ── App Ready ─────────────────────────────────────────────
 app.whenReady().then(async () => {
-  // Mac dock hide karo
   if (PLATFORM === "darwin") app.dock?.hide();
 
-  // Single instance lock
   const gotLock = app.requestSingleInstanceLock();
   if (!gotLock) { app.quit(); return; }
 
   app.on("second-instance", () => {
     const st = loadState();
-    if (st.userId && st.modelReady && !st.userDisconnected) {
-      createWorkspaceWindow(st.agentCode);
-    } else {
-      if (splashWindow && !splashWindow.isDestroyed()) {
-        splashWindow.focus();
-      } else {
-        createSplashWindow();
-      }
-    }
+    if (st.userId && st.modelReady && !st.userDisconnected) createWorkspaceWindow(st.agentCode);
+    else if (splashWindow && !splashWindow.isDestroyed()) splashWindow.focus();
+    else createSplashWindow();
   });
 
-  let state = loadState();
+  initMemory();
 
-  // ── Permanent machine code generate karo ──────────────
-  const code = generatePermanentCode();
+  const code     = generatePermanentCode();
+  let   state    = loadState();
+  const updateMenu = createTray();
+  const specs    = getPCSpecs();
 
-  // ── First time setup ───────────────────────────────────
+  // Setup auto updater
+  setupAutoUpdater();
+
   if (!state.isSetup) {
-    // Permissions maango
     const r = await dialog.showMessageBox({
-      type:      "info",
-      title:     "Agentic Vnus — Permissions",
-      message:   "Agentic Vnus needs some permissions to work.",
-      detail:    PLATFORM === "darwin"
-        ? "✅ Accessibility access\n✅ Full Disk Access\n✅ Network access\n✅ Install local AI model"
-        : "✅ File system access\n✅ Network access\n✅ Run at startup\n✅ Install local AI model",
-      buttons:   ["Grant & Continue", "Cancel"],
-      defaultId: 0,
-      cancelId:  1,
+      type: "info", title: "Agentic Vnus",
+      message: "Agentic Vnus needs a few permissions to work.",
+      detail: "✅ File system access\n✅ Network access\n✅ Run at startup\n✅ Install local AI model",
+      buttons: ["Continue", "Cancel"], defaultId: 0, cancelId: 1,
     });
-
     if (r.response !== 0) { app.quit(); return; }
 
-    if (PLATFORM === "darwin") {
-      systemPreferences.isTrustedAccessibilityClient(true);
-    }
-
-    addToStartup();
-
     const pcInfo = getPCInfo();
-    await registerAgent(code, pcInfo);
-
-    state = saveState({
-      isSetup:          true,
-      agentCode:        code,
-      userId:           null,
-      plan:             null,
-      planVerified:     false,
-      selectedModel:    null,
-      modelReady:       false,
-      userDisconnected: false,
-    });
+    await rtdbRegisterAgent(code, pcInfo);
+    state = saveState({ isSetup: true, agentCode: code, userId: null, plan: null, planVerified: false, selectedModel: null, modelReady: false, userDisconnected: false });
   } else {
-    // Returning user
     state.agentCode = code;
-
-    // Firestore se check karo disconnect hua tha kya
-    const fsDoc            = await firestoreGet(`agent_connections/${code}`);
-    const userDisconnected = fsDoc?.userDisconnected?.booleanValue || false;
-
-    if (userDisconnected) {
-      state = saveState({
-        userId:           null,
-        userDisconnected: true,
-        plan:             null,
-        planVerified:     false,
-        modelReady:       false,
-        selectedModel:    null,
-      });
-      // Firestore reset
-      await firestorePatch(`agent_connections/${code}`, {
-        status:           "waiting",
-        userId:           null,
-        userDisconnected: false,
-      }, ["status", "userId", "userDisconnected"]);
-    } else {
-      // Ensure Firestore me code registered hai
-      const pcInfo = getPCInfo();
-      if (!fsDoc) await registerAgent(code, pcInfo);
-      saveState({ agentCode: code });
+    const wsData = await rtdbGet(RTDB_URL, `/workspaces/${code}`, firebaseConfig.apiKey);
+    if (wsData?.userDisconnected) {
+      state = saveState({ userId: null, userDisconnected: true, plan: null, planVerified: false, modelReady: false, selectedModel: null });
+      await rtdbPatch(RTDB_URL, `/workspaces/${code}`, { status: "waiting", userId: null, userDisconnected: false }, firebaseConfig.apiKey);
     }
+    if (!wsData) {
+      const pcInfo = getPCInfo();
+      await rtdbRegisterAgent(code, pcInfo);
+    }
+    saveState({ agentCode: code });
     state = loadState();
   }
 
-  // Tray banao
-  const updateMenu = createTray();
-
-  // Splash banao
   createSplashWindow();
 
-  const specs = getPCSpecs();
-
-  // Splash ready hone pe initial data bhejo
   splashWindow?.once("ready-to-show", async () => {
     await new Promise(r => setTimeout(r, 300));
-
     const st = loadState();
 
-    // ── CASE 1: Pehle se connected + plan verified + model ready ──
+    // Already fully ready
     if (st.userId && st.planVerified && st.modelReady && st.selectedModel && !st.userDisconnected) {
       updateMenu(true);
-      sendToSplash("agent-data", {
-        code:      st.agentCode,
-        pcName:    os.hostname(),
-        os:        getOSName(),
-        connected: true,
-        plan:      st.plan,
-      });
-
-      // Command listener start karo
-      if (!commandListener) {
-        commandListener = startCommandListener(st.agentCode, firebaseConfig, st.selectedModel);
-      }
-
-      // Workspace directly kholo
+      sendToSplash("agent-data", { code: st.agentCode, pcName: os.hostname(), os: getOSName(), connected: true, plan: st.plan });
+      startFullAgent(st.agentCode, st.selectedModel);
       setTimeout(() => createWorkspaceWindow(st.agentCode), 800);
       return;
     }
 
-    // ── CASE 2: Connected + plan verified + model NOT ready ──
+    // Connected but model not ready
     if (st.userId && st.planVerified && !st.modelReady) {
       updateMenu(true);
-      sendToSplash("agent-data", {
-        code:      st.agentCode,
-        pcName:    os.hostname(),
-        os:        getOSName(),
-        connected: true,
-        plan:      st.plan,
-      });
-      const modelOptions = getModelOptions(st.plan, specs);
-      sendToSplash("show-model-picker", { specs, modelOptions, plan: st.plan });
+      sendToSplash("agent-data", { code: st.agentCode, pcName: os.hostname(), os: getOSName(), connected: true, plan: st.plan });
+      sendToSplash("show-model-picker", { specs, modelOptions: getModelOptions(st.plan, specs), plan: st.plan });
       return;
     }
 
-    // ── CASE 3: Not connected / plan not chosen ──
-    // Sirf code dikho — baki sab website pe hoga
-    sendToSplash("agent-data", {
-      code:      st.agentCode || code,
-      pcName:    os.hostname(),
-      os:        getOSName(),
-      connected: false,
-      plan:      null,
-    });
+    // Show code — waiting for connection
+    sendToSplash("agent-data", { code: st.agentCode || code, pcName: os.hostname(), os: getOSName(), connected: false, plan: null });
 
-    // Connection ke liye wait karo
-    listenForConnection(
-      code,
-
-      // onConnected — user ne website pe code daala
-      async (userId, planFromFirestore) => {
+    listenForConnection(code,
+      async (userId, planFromRTDB) => {
         saveState({ userId, userDisconnected: false });
         updateMenu(true);
-
         sendToSplash("workspace-connected", { userId });
+        sendToSplash("waiting-for-plan", { message: "Waiting for plan selection..." });
 
-        // Plan check karo — website pe plan choose kiya hoga
-        sendToSplash("waiting-for-plan", {
-          message: "Waiting for plan selection on website...",
-        });
-
-        // Plan verification ke liye poll karo
         listenForPlanVerification(userId, async (plan) => {
           saveState({ plan, planVerified: true });
-          updateMenu(true);
-
           sendToSplash("plan-verified", { plan });
-
-          // Model picker dikho
-          const modelOptions = getModelOptions(plan, specs);
-          sendToSplash("show-model-picker", { specs, modelOptions, plan });
+          sendToSplash("show-model-picker", { specs, modelOptions: getModelOptions(plan, specs), plan });
         });
       },
-
-      // onDisconnected
       async () => {
-        saveState({
-          userId:           null,
-          userDisconnected: true,
-          plan:             null,
-          planVerified:     false,
-          modelReady:       false,
-          selectedModel:    null,
-        });
+        saveState({ userId: null, userDisconnected: true, plan: null, planVerified: false, modelReady: false, selectedModel: null });
         updateMenu(false);
-
-        if (workspaceWindow && !workspaceWindow.isDestroyed()) {
-          workspaceWindow.close();
-        }
-
-        // Splash reopen karo
+        workspaceWindow?.close();
         createSplashWindow();
-        setTimeout(() => sendToSplash("agent-data", {
-          code,
-          pcName:    os.hostname(),
-          os:        getOSName(),
-          connected: false,
-          plan:      null,
-        }), 500);
+        setTimeout(() => sendToSplash("agent-data", { code, pcName: os.hostname(), os: getOSName(), connected: false, plan: null }), 500);
       }
     );
   });
 });
 
-// Window close pe app band nahi ho — tray mein rahe
-app.on("window-all-closed", (e) => {
-  if (!isQuitting) e.preventDefault();
-});
-
-app.on("before-quit", () => { isQuitting = true; });
-
+app.on("window-all-closed", (e) => { if (!isQuitting) e.preventDefault(); });
+app.on("before-quit", () => { isQuitting = true; listenerCleanup?.(); });
 app.on("activate", () => {
   const st = loadState();
-  if (st.userId && st.modelReady && !st.userDisconnected) {
-    createWorkspaceWindow(st.agentCode);
-  } else {
-    createSplashWindow();
-  }
+  if (st.userId && st.modelReady && !st.userDisconnected) createWorkspaceWindow(st.agentCode);
+  else createSplashWindow();
 });
