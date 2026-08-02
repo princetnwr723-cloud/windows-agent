@@ -10,62 +10,78 @@ on:
 
 jobs:
 
-  # ── Windows ───────────────────────────────────────────────
+  # ── Windows ─────────────────────────────────────────────
   build-windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: "20" }
-      - run: npm install
-      - run: npx playwright install chromium --with-deps
-      - run: npm run build:win
-        env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
+        with:
+          node-version: "20"
+      - name: Install dependencies
+        run: npm install
+      - name: Install Playwright
+        run: npx playwright install chromium --with-deps
+      - name: Build Windows
+        run: npm run build:win
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - uses: actions/upload-artifact@v4
         with:
           name: windows-build
           path: dist/*.exe
 
-  # ── Mac Intel (x64) ───────────────────────────────────────
+  # ── Mac Intel (x64) ─────────────────────────────────────
   build-mac-x64:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: "20" }
-      - run: npm install
-      - run: npx playwright install chromium --with-deps
-      - run: npm run build:mac
-        env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
+        with:
+          node-version: "20"
+      - name: Install dependencies
+        run: npm install
+      - name: Install Playwright
+        run: npx playwright install chromium --with-deps
+      - name: Build Mac x64
+        run: npm run build:mac
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - uses: actions/upload-artifact@v4
         with:
           name: mac-x64-build
           path: dist/*-x64.dmg
 
-  # ── Mac Apple Silicon (arm64) ─────────────────────────────
+  # ── Mac Apple Silicon (arm64) ───────────────────────────
   build-mac-arm64:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: "20" }
-      - run: npm install
-      - run: npx playwright install chromium --with-deps
-      - run: npm run build:mac:arm
-        env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
+        with:
+          node-version: "20"
+      - name: Install dependencies
+        run: npm install
+      - name: Install Playwright
+        run: npx playwright install chromium --with-deps
+      - name: Build Mac arm64
+        run: npm run build:mac:arm
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - uses: actions/upload-artifact@v4
         with:
           name: mac-arm64-build
           path: dist/*-arm64.dmg
 
-  # ── Linux ─────────────────────────────────────────────────
+  # ── Linux ────────────────────────────────────────────────
   build-linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: "20" }
-      - name: Install Linux deps
+        with:
+          node-version: "20"
+      - name: Install Linux system deps
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -75,16 +91,20 @@ jobs:
             libcups2t64 libxkbcommon0 libxcomposite1 \
             libxdamage1 libxfixes3 libxrandr2 libgbm1 \
             libasound2t64 libpango-1.0-0 libcairo2
-      - run: npm install
-      - run: npx playwright install chromium --with-deps
-      - run: npm run build:linux
-        env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
+      - name: Install dependencies
+        run: npm install
+      - name: Install Playwright
+        run: npx playwright install chromium --with-deps
+      - name: Build Linux
+        run: npm run build:linux
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - uses: actions/upload-artifact@v4
         with:
           name: linux-build
           path: dist/*.AppImage
 
-  # ── Release ───────────────────────────────────────────────
+  # ── Release (only on v* tags) ───────────────────────────
   release:
     needs: [build-windows, build-mac-x64, build-mac-arm64, build-linux]
     runs-on: ubuntu-latest
@@ -103,4 +123,4 @@ jobs:
           prerelease: false
           fail_on_unmatched_files: false
         env:
-          GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
