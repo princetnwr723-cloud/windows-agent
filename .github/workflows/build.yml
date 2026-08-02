@@ -26,10 +26,13 @@ jobs:
         run: npm run build:win
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+          ELECTRON_BUILDER_NO_PUBLISH: true
       - uses: actions/upload-artifact@v4
         with:
           name: windows-build
           path: dist/*.exe
+          if-no-files-found: warn
 
   # ── Mac Intel (x64) ─────────────────────────────────────
   build-mac-x64:
@@ -47,10 +50,13 @@ jobs:
         run: npm run build:mac
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+          ELECTRON_BUILDER_NO_PUBLISH: true
       - uses: actions/upload-artifact@v4
         with:
           name: mac-x64-build
           path: dist/*-x64.dmg
+          if-no-files-found: warn
 
   # ── Mac Apple Silicon (arm64) ───────────────────────────
   build-mac-arm64:
@@ -68,10 +74,13 @@ jobs:
         run: npm run build:mac:arm
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+          ELECTRON_BUILDER_NO_PUBLISH: true
       - uses: actions/upload-artifact@v4
         with:
           name: mac-arm64-build
           path: dist/*-arm64.dmg
+          if-no-files-found: warn
 
   # ── Linux ────────────────────────────────────────────────
   build-linux:
@@ -99,25 +108,34 @@ jobs:
         run: npm run build:linux
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+          ELECTRON_BUILDER_NO_PUBLISH: true
       - uses: actions/upload-artifact@v4
         with:
           name: linux-build
           path: dist/*.AppImage
+          if-no-files-found: warn
 
-  # ── Release (only on v* tags) ───────────────────────────
+  # ── Release (sirf v* tags pe) ───────────────────────────
   release:
     needs: [build-windows, build-mac-x64, build-mac-arm64, build-linux]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: List files
+        run: find artifacts -type f
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            windows-build/*.exe
-            mac-x64-build/*.dmg
-            mac-arm64-build/*.dmg
-            linux-build/*.AppImage
+            artifacts/windows-build/*.exe
+            artifacts/mac-x64-build/*.dmg
+            artifacts/mac-arm64-build/*.dmg
+            artifacts/linux-build/*.AppImage
           generate_release_notes: true
           draft: false
           prerelease: false
