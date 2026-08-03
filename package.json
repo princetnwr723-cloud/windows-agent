@@ -12,15 +12,14 @@
     "build:win":       "electron-builder --win",
     "build:mac":       "electron-builder --mac --x64",
     "build:mac:arm":   "electron-builder --mac --arm64",
-    "build:mac:both":  "electron-builder --mac --x64 --arm64",
     "build:linux":     "electron-builder --linux",
     "postinstall":     "electron-builder install-app-deps",
     "install-browser": "playwright install chromium --with-deps"
   },
   "dependencies": {
-    "playwright":       "^1.45.0",
-    "node-machine-id":  "^1.1.12",
-    "node-cron":        "^3.0.3",
+    "playwright":      "^1.45.0",
+    "node-machine-id": "^1.1.12",
+    "node-cron":       "^3.0.3",
     "electron-updater": "^6.1.7"
   },
   "devDependencies": {
@@ -46,9 +45,7 @@
       "!**/node_modules/.bin"
     ],
     "win": {
-      "target": [
-        { "target": "nsis", "arch": ["x64"] }
-      ],
+      "target": [{ "target": "nsis", "arch": ["x64"] }],
       "icon": "assets/icon.png",
       "requestedExecutionLevel": "requireAdministrator",
       "artifactName": "AgenticVnus-Setup-${version}.${ext}"
@@ -63,9 +60,7 @@
       "artifactName": "AgenticVnus-${version}-${arch}.${ext}"
     },
     "linux": {
-      "target": [
-        { "target": "AppImage", "arch": ["x64"] }
-      ],
+      "target": [{ "target": "AppImage", "arch": ["x64"] }],
       "icon":     "assets/icon.png",
       "category": "Utility",
       "artifactName": "AgenticVnus-${version}.${ext}"
@@ -79,12 +74,6 @@
       "createStartMenuShortcut":            true,
       "shortcutName":                       "Agentic Vnus",
       "include":                            "build/installer.nsh"
-    },
-    "publish": {
-      "provider":    "github",
-      "owner":       "TUMHARA_GITHUB_USERNAME",
-      "repo":        "vnus-agent",
-      "releaseType": "release"
     }
   }
 }
