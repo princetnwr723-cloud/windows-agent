@@ -1,9 +1,8 @@
-// src/main.js — Complete with RTDB + Auto-updater + Scheduler
+// src/main.js — Complete with RTDB + Scheduler
 const {
   app, BrowserWindow, Tray, Menu, nativeImage,
   shell, dialog, ipcMain, screen,
 } = require("electron");
-const { autoUpdater } = require("electron-updater");
 const path            = require("path");
 const os              = require("os");
 const fs              = require("fs");
@@ -113,60 +112,6 @@ async function listenForPlanVerification(userId, onVerified) {
   });
 }
 
-// ── Auto Updater ──────────────────────────────────────────
-function setupAutoUpdater() {
-  autoUpdater.autoDownload    = true;
-  autoUpdater.autoInstallOnAppQuit = true;
-
-  autoUpdater.on("checking-for-update", () => {
-    console.log("🔍 Checking for updates...");
-  });
-
-  autoUpdater.on("update-available", (info) => {
-    console.log(`📦 Update available: v${info.version}`);
-    tray?.setToolTip(`Agentic Vnus — Downloading update v${info.version}...`);
-    sendToSplash("update-status", { status: "downloading", version: info.version });
-  });
-
-  autoUpdater.on("update-not-available", () => {
-    console.log("✅ App is up to date");
-  });
-
-  autoUpdater.on("download-progress", (progress) => {
-    const pct = Math.round(progress.percent);
-    console.log(`📥 Update download: ${pct}%`);
-    tray?.setToolTip(`Agentic Vnus — Update ${pct}%`);
-  });
-
-  autoUpdater.on("update-downloaded", (info) => {
-    console.log(`✅ Update downloaded: v${info.version}`);
-    tray?.setToolTip("Agentic Vnus — Update ready");
-
-    dialog.showMessageBox({
-      type:      "info",
-      title:     "Update Ready — Agentic Vnus",
-      message:   `v${info.version} is ready to install`,
-      detail:    "The update has been downloaded. Restart now to apply it — takes less than 30 seconds.",
-      buttons:   ["Restart & Install", "Later"],
-      defaultId: 0,
-      icon:      path.join(__dirname, "../assets/icon.png"),
-    }).then(result => {
-      if (result.response === 0) {
-        isQuitting = true;
-        autoUpdater.quitAndInstall();
-      }
-    });
-  });
-
-  autoUpdater.on("error", (err) => {
-    console.error("❌ Auto-update error:", err.message);
-  });
-
-  // Check on startup, then every 4 hours
-  setTimeout(() => autoUpdater.checkForUpdates(), 10000);
-  setInterval(() => autoUpdater.checkForUpdates(), 4 * 60 * 60 * 1000);
-}
-
 // ── Splash helpers ────────────────────────────────────────
 function sendToSplash(event, data) {
   if (splashWindow && !splashWindow.isDestroyed()) {
@@ -236,8 +181,6 @@ function createTray() {
       { type: "separator" },
       { label: "Open Workspace", enabled: connected && st.modelReady, click: () => createWorkspaceWindow(st.agentCode) },
       { label: "Open Website",   click: () => shell.openExternal(WEBSITE) },
-      { type: "separator" },
-      { label: "Check for Updates", click: () => autoUpdater.checkForUpdates() },
       { type: "separator" },
       { label: "Quit", click: () => { isQuitting = true; app.quit(); } },
     ]));
@@ -346,9 +289,6 @@ app.whenReady().then(async () => {
   let   state    = loadState();
   const updateMenu = createTray();
   const specs    = getPCSpecs();
-
-  // Setup auto updater
-  setupAutoUpdater();
 
   if (!state.isSetup) {
     const r = await dialog.showMessageBox({
