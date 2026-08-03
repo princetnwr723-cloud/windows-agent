@@ -19,8 +19,7 @@
   "dependencies": {
     "playwright":      "^1.45.0",
     "node-machine-id": "^1.1.12",
-    "node-cron":       "^3.0.3",
-    "electron-updater": "^6.1.7"
+    "node-cron":       "^3.0.3"
   },
   "devDependencies": {
     "electron":         "^31.0.0",
@@ -31,6 +30,7 @@
     "productName": "Agentic Vnus",
     "asar":        true,
     "icon":        "assets/icon.png",
+    "publish":     null,
     "directories": {
       "output":         "dist",
       "buildResources": "assets"
