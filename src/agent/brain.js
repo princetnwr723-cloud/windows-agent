@@ -1,524 +1,515 @@
-// src/agent/brain.js
-// ✅ Chain of Thought prompting — coding & reasoning 20-30% better
-// ✅ Task-type detection — coding tasks pe coder model route
-// ✅ JSON retry loop (3 attempts)
-// ✅ Permission system integrated
-// ✅ Memory + Skills integrated
+// src/agent/brain-v2.js
+// ═══════════════════════════════════════════════════════════
+// UPGRADED BRAIN — Multi-Agent + Business DNA + Proactive
+// ═══════════════════════════════════════════════════════════
 
-const { execSync }        = require("child_process");
-const path                = require("path");
-const fs                  = require("fs");
-const os                  = require("os");
+const { execSync }       = require("child_process");
+const path               = require("path");
+const fs                 = require("fs");
+const os                 = require("os");
 const { runOllamaPrompt, runOllamaVision } = require("./ollamaManager");
-const { buildMemoryPrompt, extractLearnings, saveSession, initMemory } = require("./memory");
-const { shouldCreateSkill, generateSkill, getSkillForCommand, getSkillsSummary } = require("./skills");
-const { checkAndRequestPermission, assessCommandRisk } = require("./permissions");
+const { buildMemoryPrompt, updateMemory }  = require("./memory");
+const { buildSkillPrompt, saveSkill }      = require("./skills");
+const { buildBusinessPrompt, loadDNA, isDNASetup, SETUP_QUESTIONS, processSetupAnswer, completeSetup } = require("./businessDNA");
+const { executeTeam, needsTeam }           = require("./multiAgent");
+const { generateMorningBriefing, scanForOpportunities } = require("./proactiveAgent");
 const {
   browserGoto, browserClick, browserType, browserFill,
   browserWait, browserExtract, browserExtractTable,
-  browserScreenshot, browserKey, browserSelect, browserScroll,
-  browserHover, browserExists, browserNewTab, browserEval, browserSmartLogin,
+  browserScreenshot, browserKey, browserSelect,
+  browserScroll, browserGetInfo, browserHover,
+  browserExists, browserEval, browserNewTab,
+  browserSmartLogin, initBrowser,
 } = require("./browserAgent");
 const {
   githubAuth, githubListRepos, githubListFiles, githubReadFile,
-  githubWriteFile, githubDeleteFile, githubCreateRepo, githubCreateBranch,
-  githubCreatePR, githubListIssues, githubCreateIssue,
-  githubSearch, githubCloneLocally, githubCommitMultiple,
+  githubWriteFile, githubDeleteFile, githubCreateRepo,
+  githubCreateBranch, githubCreatePR, githubListIssues,
+  githubCreateIssue, githubSearch, githubCloneLocally,
+  githubCommitMultiple,
 } = require("./githubAgent");
 
-initMemory();
+// ── Setup Conversation State ───────────────────────────────
+const SETUP_STATE_FILE = path.join(os.homedir(), ".vnus-agent", "setup-state.json");
 
-// ── Global context ────────────────────────────────────────
-let _workspaceId    = null;
-let _firebaseConfig = null;
-let _chatContext    = {};
-
-function setAgentContext(workspaceId, firebaseConfig, chatContext = {}) {
-  _workspaceId    = workspaceId;
-  _firebaseConfig = firebaseConfig;
-  _chatContext    = chatContext;
+function loadSetupState() {
+  try { return JSON.parse(fs.readFileSync(SETUP_STATE_FILE, "utf8")); }
+  catch { return { inProgress: false, currentQuestion: 0, answers: {}, dna: null }; }
 }
 
-// ── Task type detection ───────────────────────────────────
-function detectTaskType(command) {
-  const lower = command.toLowerCase();
-
-  // Coding task
-  if (/(write|create|build|make|generate|fix|debug|refactor|optimize|review)\s.*(code|script|function|class|component|app|api|website|html|css|js|python|react|node)/i.test(command) ||
-      /(code|script|function|class|bug|error|exception|compile|syntax|algorithm|implement)/i.test(command)) {
-    return "coding";
-  }
-
-  // Reasoning task
-  if (/(why|explain|analyze|reason|think|understand|compare|difference|how does|what is the best|should i|pros and cons)/i.test(command)) {
-    return "reasoning";
-  }
-
-  // Browser task
-  if (/(open|go to|navigate|search|click|fill|extract|scrape|browse|website|http)/i.test(command)) {
-    return "browser";
-  }
-
-  // File task
-  if (/(file|folder|directory|read|write|delete|create|copy|move|rename|save)/i.test(command)) {
-    return "files";
-  }
-
-  // GitHub task
-  if (/(github|git|repo|commit|push|pull|branch|pr|issue|merge)/i.test(command)) {
-    return "github";
-  }
-
-  return "general";
+function saveSetupState(state) {
+  const dir = path.dirname(SETUP_STATE_FILE);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(SETUP_STATE_FILE, JSON.stringify(state, null, 2));
 }
 
-// ── Select best model for task ────────────────────────────
-function selectModelForTask(taskType, modelConfig) {
-  // Agar dedicated coder model available hai to coding pe use karo
-  if (taskType === "coding" && modelConfig.coderOllamaId) {
-    console.log(`🎯 Task: coding — switching to coder model: ${modelConfig.coderOllamaId}`);
-    return { ...modelConfig, ollamaId: modelConfig.coderOllamaId };
-  }
-  return modelConfig;
+function clearSetupState() {
+  try { fs.unlinkSync(SETUP_STATE_FILE); } catch {}
 }
 
-// ── Chain of Thought prompt ───────────────────────────────
-function getCoTInstruction(taskType) {
-  if (taskType === "coding") {
-    return `
-CODING REASONING STEPS (follow these before writing code):
-1. What language/framework is needed?
-2. What is the exact file path and name?
-3. What are the edge cases or common errors to avoid?
-4. Write the complete, working code — no placeholders, no "TODO"s.
-5. Then output the JSON actions.`;
-  }
-
-  if (taskType === "reasoning") {
-    return `
-REASONING STEPS (think before acting):
-1. What exactly is being asked?
-2. What information do I have vs what do I need?
-3. What is the most logical step-by-step approach?
-4. Output the JSON actions based on this reasoning.`;
-  }
-
-  if (taskType === "browser") {
-    return `
-BROWSER TASK STEPS:
-1. What is the exact URL or site to open?
-2. What elements need to be clicked/filled?
-3. Use browser_* actions — they are more reliable than click/type.
-4. Use browser_wait before interacting with any element.`;
-  }
-
-  return `
-TASK STEPS:
-1. What exactly does the user want?
-2. What is the simplest correct approach?
-3. Output JSON actions.`;
+// ── Detect if user wants to setup Business DNA ────────────
+function isBusinessSetupRequest(command) {
+  return /introduce.*business|setup.*business|business.*dna|meet.*business|tell.*about.*business|my.*business.*is|set.*up.*agent.*role|configure.*agent/i.test(command);
 }
 
-// ── Build system prompt with CoT ─────────────────────────
-function buildSystemPrompt(taskType = "general") {
-  const memoryContext = buildMemoryPrompt();
-  const skillsContext = getSkillsSummary();
-  const cotSteps      = getCoTInstruction(taskType);
+// ── Detect if asking for team ──────────────────────────────
+function isTeamRequest(command) {
+  return /assemble.*team|create.*team|use.*team|multi.*agent|get.*team|build.*with.*team/i.test(command) || needsTeam(command);
+}
 
-  return `You are Agentic Vnus, a self-improving AI agent running on the user's PC.
-CRITICAL: Respond ONLY with a valid JSON array. No markdown, no explanation, no text outside the array.
+// ── Detect briefing request ────────────────────────────────
+function isBriefingRequest(command) {
+  return /morning.*brief|daily.*brief|brief.*me|what.*today|daily.*update|status.*update|how.*business.*doing/i.test(command);
+}
 
+// ── Main System Prompt Builder ─────────────────────────────
+function buildSystemPrompt(modelConfig) {
+  const businessContext = buildBusinessPrompt();
+  const memoryContext   = buildMemoryPrompt();
+  const skillContext    = buildSkillPrompt();
+  const dna             = loadDNA();
+  const hasDNA          = isDNASetup();
+
+  const agentIdentity = hasDNA
+    ? `You are ${dna.agentName || "Vnus"}, the AI ${dna.agentRole || "CEO"} of ${dna.business?.name || "the user's business"}.`
+    : `You are Vnus, an advanced AI agent running on the user's PC.`;
+
+  return `${agentIdentity}
+You execute tasks through a JSON array of actions.
+
+${businessContext}
 ${memoryContext}
-${skillsContext}
+${skillContext}
 
-${cotSteps}
+═══ SPECIAL COMMANDS ═══
+- If user wants to introduce their business → respond with: [{"action":"start_business_setup"}]
+- If task needs multiple agents → respond with: [{"action":"assemble_team","task":"full task description"}]
+- If user asks for briefing → respond with: [{"action":"generate_briefing"}]
+- If user asks for opportunities → respond with: [{"action":"scan_opportunities"}]
 
-═══ AVAILABLE ACTIONS ═══
+═══ PC CONTROL ACTIONS ═══
+- { "action": "open", "app": "chrome|firefox|vscode|terminal|explorer|notepad" }
+- { "action": "click", "x": number, "y": number }
+- { "action": "type", "text": "string" }
+- { "action": "key", "key": "Enter|Tab|Escape|ctrl+s|ctrl+n|ctrl+v|ctrl+c" }
+- { "action": "scroll", "x": number, "y": number, "direction": "up|down", "amount": number }
+- { "action": "wait", "ms": number }
+- { "action": "screenshot" }
+- { "action": "write_file", "path": "/path/file.ext", "content": "full content" }
+- { "action": "read_file", "path": "/path/file.ext" }
+- { "action": "run_command", "command": "shell command" }
 
-PC CONTROL:
-{"action":"open","app":"chrome|firefox|vscode|terminal|explorer|notepad|calculator"}
-{"action":"click","x":500,"y":300}
-{"action":"type","text":"hello world"}
-{"action":"key","key":"Enter|Tab|Escape|ctrl+s|ctrl+c|ctrl+v|ctrl+z|ctrl+a"}
-{"action":"scroll","x":500,"y":300,"direction":"up|down","amount":3}
-{"action":"wait","ms":1000}
-{"action":"screenshot"}
-{"action":"write_file","path":"C:/Users/USERNAME/Desktop/file.txt","content":"full content here"}
-{"action":"read_file","path":"C:/Users/USERNAME/Desktop/file.txt"}
-{"action":"run_command","command":"dir C:\\Users\\USERNAME\\Desktop"}
+═══ BROWSER ACTIONS ═══
+- { "action": "browser_goto", "url": "https://..." }
+- { "action": "browser_click", "selector": "button.submit" }
+- { "action": "browser_type", "selector": "#input", "text": "hello" }
+- { "action": "browser_fill", "selector": "#input", "text": "hello" }
+- { "action": "browser_wait", "selector": ".element", "state": "visible" }
+- { "action": "browser_extract", "selector": ".content", "what": "text|html|all_text" }
+- { "action": "browser_screenshot" }
+- { "action": "browser_eval", "script": "return document.title" }
 
-BROWSER (preferred for web tasks):
-{"action":"browser_goto","url":"https://example.com"}
-{"action":"browser_click","selector":"button.submit"}
-{"action":"browser_type","selector":"#input","text":"hello"}
-{"action":"browser_fill","selector":"#input","text":"hello"}
-{"action":"browser_wait","selector":".element","state":"visible"}
-{"action":"browser_extract","selector":".content","what":"text|html|value|all_text"}
-{"action":"browser_screenshot"}
-{"action":"browser_key","key":"Enter|Tab|Escape"}
-{"action":"browser_scroll","direction":"down","amount":500}
-{"action":"browser_eval","script":"return document.title"}
+═══ GITHUB ACTIONS ═══
+- { "action": "github_read_file", "owner": "user", "repo": "repo", "path": "src/index.js" }
+- { "action": "github_write_file", "owner": "user", "repo": "repo", "path": "file.js", "content": "...", "message": "commit msg" }
+- { "action": "github_create_repo", "name": "my-repo", "description": "..." }
+- { "action": "github_create_pr", "owner": "user", "repo": "repo", "title": "...", "body": "...", "head": "feature/x" }
+- { "action": "github_list_issues", "owner": "user", "repo": "repo" }
 
-GITHUB:
-{"action":"github_auth","token":"ghp_..."}
-{"action":"github_list_repos"}
-{"action":"github_read_file","owner":"user","repo":"repo","path":"src/index.js"}
-{"action":"github_write_file","owner":"user","repo":"repo","path":"file.js","content":"...","message":"commit"}
-{"action":"github_create_repo","name":"my-repo","description":"...","private":false}
-{"action":"github_create_pr","owner":"user","repo":"repo","title":"PR title","body":"description","head":"feature","base":"main"}
+═══ FLOW CONTROL ═══
+- { "action": "done", "message": "Task complete", "output": "result" }
+- { "action": "error", "message": "Cannot complete because..." }
 
-FLOW:
-{"action":"done","message":"What was accomplished"}
-{"action":"error","message":"Why it failed and what user should do"}
-
-═══ STRICT RULES ═══
-1. USERNAME is auto-replaced with actual system username
-2. Always use browser_* for web tasks — never use click/type for browsers
-3. For code files — write COMPLETE code, never truncate or use placeholders
-4. Always end with done or error action
-5. ONLY output the JSON array — no text before or after`;
+═══ RULES ═══
+1. Business DNA is always your context — every response should serve the business.
+2. Complex tasks → assemble_team action.
+3. If user seems stressed or asks for status → generate_briefing.
+4. Always end with done or error.
+5. Respond ONLY with valid JSON array.`;
 }
 
-// ── Screenshot ────────────────────────────────────────────
+// ── Screenshot ─────────────────────────────────────────────
 async function takeScreenshot() {
   const tmpPath = path.join(os.tmpdir(), `vnus-ss-${Date.now()}.png`);
   try {
     if (os.platform() === "win32") {
-      const ps = `Add-Type -AssemblyName System.Windows.Forms,System.Drawing;$s=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds;$b=New-Object System.Drawing.Bitmap($s.Width,$s.Height);$g=[System.Drawing.Graphics]::FromImage($b);$g.CopyFromScreen($s.Location,[System.Drawing.Point]::Empty,$s.Size);$b.Save('${tmpPath.replace(/\\/g,"\\\\")}}');$g.Dispose();$b.Dispose()`;
-      execSync(`powershell -NoProfile -NonInteractive -Command "${ps}"`, { timeout: 10000, stdio: "pipe" });
+      const ps = `Add-Type -AssemblyName System.Windows.Forms;$s=$([System.Windows.Forms.Screen]::PrimaryScreen.Bounds);$b=New-Object System.Drawing.Bitmap($s.Width,$s.Height);$g=[System.Drawing.Graphics]::FromImage($b);$g.CopyFromScreen($s.Location,[System.Drawing.Point]::Empty,$s.Size);$b.Save('${tmpPath.replace(/\\/g, "\\\\")}');$g.Dispose();$b.Dispose();`.replace(/\n/g, " ");
+      execSync(`powershell -Command "${ps}"`);
     } else if (os.platform() === "darwin") {
-      execSync(`screencapture -x "${tmpPath}"`, { timeout: 5000, stdio: "pipe" });
+      execSync(`screencapture -x "${tmpPath}"`);
     } else {
-      execSync(`scrot "${tmpPath}"`, { timeout: 5000, stdio: "pipe" });
+      execSync(`scrot "${tmpPath}"`);
     }
-    if (fs.existsSync(tmpPath)) {
-      const base64 = fs.readFileSync(tmpPath).toString("base64");
-      fs.unlinkSync(tmpPath);
-      return base64;
-    }
-    return null;
+    const base64 = fs.readFileSync(tmpPath).toString("base64");
+    fs.unlinkSync(tmpPath);
+    return base64;
   } catch { return null; }
 }
 
-// ── File operations ───────────────────────────────────────
+// ── File ops ───────────────────────────────────────────────
 async function writeFile(filePath, content) {
-  const resolved = resolvePath(filePath);
-  const dir      = path.dirname(resolved);
+  const dir = path.dirname(filePath);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(resolved, content, "utf8");
-  console.log(`✅ File written: ${resolved}`);
-  return resolved;
+  fs.writeFileSync(filePath, content, "utf8");
+  return filePath;
 }
 
 function readFile(filePath) {
-  try {
-    const resolved = resolvePath(filePath);
-    if (!fs.existsSync(resolved)) return `Error: File not found: ${resolved}`;
-    const content  = fs.readFileSync(resolved, "utf8");
-    return content.length > 4000 ? content.slice(0, 4000) + "\n...(truncated)" : content;
-  } catch (err) { return `Error: ${err.message}`; }
+  try { return fs.readFileSync(filePath, "utf8"); }
+  catch { return null; }
 }
 
-// ── Run command with permission check ─────────────────────
 async function runCommand(command) {
-  const risk = assessCommandRisk(command);
-  if (risk.level === "blocked") throw new Error(`🚫 Blocked: ${risk.reason}`);
-
-  if ((risk.level === "high" || risk.level === "medium") && _workspaceId && _firebaseConfig) {
-    const perm = await checkAndRequestPermission(
-      "run_command", { command }, _workspaceId, _firebaseConfig, _chatContext
-    );
-    if (perm.blocked)  throw new Error(`🚫 Blocked: ${perm.reason}`);
-    if (!perm.allowed) throw new Error(perm.reason === "timeout" ? "⏰ Permission timeout" : "❌ User denied");
-  }
-
-  const out = execSync(command, { encoding: "utf8", shell: true, timeout: 60000, maxBuffer: 1024 * 1024 });
-  return out || "Done";
-}
-
-// ── Open app ──────────────────────────────────────────────
-async function openApp(appName) {
-  const p   = os.platform();
-  const app = (appName || "").toLowerCase();
-  const map = {
-    chrome:     { win32:"start chrome",   darwin:"open -a 'Google Chrome'", linux:"google-chrome &" },
-    firefox:    { win32:"start firefox",  darwin:"open -a Firefox",         linux:"firefox &" },
-    vscode:     { win32:"code .",         darwin:"open -a 'Visual Studio Code'", linux:"code &" },
-    terminal:   { win32:"start cmd",      darwin:"open -a Terminal",         linux:"x-terminal-emulator &" },
-    explorer:   { win32:"explorer .",     darwin:"open .",                   linux:"nautilus . &" },
-    notepad:    { win32:"notepad",        darwin:"open -a TextEdit",         linux:"gedit &" },
-    calculator: { win32:"calc",           darwin:"open -a Calculator",       linux:"gnome-calculator &" },
-  };
-  const cmd = map[app]?.[p];
-  if (cmd) execSync(cmd, { shell: true, stdio: "pipe" });
-  else {
-    if (p === "win32")       execSync(`start ${appName}`,        { shell: true, stdio: "pipe" });
-    else if (p === "darwin") execSync(`open -a "${appName}"`,    { shell: true, stdio: "pipe" });
-    else                     execSync(`${appName} &`,            { shell: true, stdio: "pipe" });
-  }
-}
-
-// ── PC controls ───────────────────────────────────────────
-async function mouseClick(x, y) {
-  const p = os.platform();
-  if (p === "win32") {
-    const ps = `Add-Type @'
-using System;using System.Runtime.InteropServices;
-public class M{[DllImport("user32.dll")]public static extern bool SetCursorPos(int x,int y);[DllImport("user32.dll")]public static extern void mouse_event(int f,int dx,int dy,int b,int e);}
-'@;[M]::SetCursorPos(${x},${y});Start-Sleep -Milliseconds 80;[M]::mouse_event(2,0,0,0,0);[M]::mouse_event(4,0,0,0,0)`;
-    execSync(`powershell -NoProfile -Command "${ps.replace(/\n/g," ")}"`, { stdio:"pipe", timeout:5000 });
-  } else if (p === "darwin") {
-    execSync(`osascript -e 'tell application "System Events" to click at {${x},${y}}'`, { stdio:"pipe" });
-  } else {
-    execSync(`xdotool mousemove ${x} ${y} click 1`, { stdio:"pipe" });
-  }
-}
-
-async function typeText(text) {
-  const p    = os.platform();
-  const safe = text.replace(/'/g, "\\'");
-  if (p === "win32") {
-    const ps = `Add-Type -AssemblyName System.Windows.Forms;[System.Windows.Forms.Clipboard]::SetText('${safe.replace(/'/g,"''")}');[System.Windows.Forms.SendKeys]::SendWait('^v')`;
-    execSync(`powershell -NoProfile -Command "${ps}"`, { stdio:"pipe", timeout:5000 });
-  } else if (p === "darwin") {
-    execSync(`osascript -e 'tell application "System Events" to keystroke "${safe}"'`, { stdio:"pipe" });
-  } else {
-    execSync(`xdotool type --clearmodifiers '${safe}'`, { stdio:"pipe" });
-  }
-}
-
-async function pressKey(key) {
-  const p    = os.platform();
-  const wMap = { "Enter":"{ENTER}","Tab":"{TAB}","Escape":"{ESC}","Backspace":"{BACKSPACE}","ctrl+s":"^s","ctrl+c":"^c","ctrl+v":"^v","ctrl+z":"^z","ctrl+a":"^a","ctrl+n":"^n" };
-  if (p === "win32") {
-    execSync(`powershell -NoProfile -Command "Add-Type -AssemblyName System.Windows.Forms;[System.Windows.Forms.SendKeys]::SendWait('${wMap[key]||key}')"`, { stdio:"pipe", timeout:5000 });
-  } else if (p === "darwin") {
-    if (key.includes("ctrl+")) execSync(`osascript -e 'tell application "System Events" to keystroke "${key.replace("ctrl+","")}" using command down'`, { stdio:"pipe" });
-  } else {
-    const xMap = { "Enter":"Return","Tab":"Tab","Escape":"Escape","ctrl+s":"ctrl+s","ctrl+c":"ctrl+c","ctrl+v":"ctrl+v" };
-    execSync(`xdotool key ${xMap[key]||key}`, { stdio:"pipe" });
-  }
-}
-
-async function scrollPage(x, y, direction, amount = 3) {
-  const p = os.platform();
-  if (p === "win32") {
-    const delta = direction === "up" ? amount*120 : -amount*120;
-    execSync(`powershell -NoProfile -Command "Add-Type -AssemblyName System.Windows.Forms;[System.Windows.Forms.Cursor]::Position=New-Object System.Drawing.Point(${x},${y})"`, { stdio:"pipe" });
-    await new Promise(r => setTimeout(r, 100));
-  } else if (p === "darwin") {
-    execSync(`osascript -e 'tell application "System Events" to scroll (get mouse location) by {0, ${direction==="up"?-amount*3:amount*3}00}'`, { stdio:"pipe" });
-  } else {
-    const btn = direction === "up" ? 4 : 5;
-    for (let i = 0; i < amount; i++) execSync(`xdotool click ${btn}`, { stdio:"pipe" });
-  }
+  return execSync(command, { encoding: "utf8", shell: true, timeout: 60000 });
 }
 
 function resolvePath(p) {
   if (!p) return p;
-  const username = os.userInfo().username;
-  p = p.replace(/\bUSERNAME\b/g, username).replace(/\bUSER\b/g, username);
-  if (p.startsWith("~/"))         return path.join(os.homedir(), p.slice(2));
-  if (p.startsWith("Desktop/"))   return path.join(os.homedir(), "Desktop",   p.slice(8));
-  if (p.startsWith("Documents/")) return path.join(os.homedir(), "Documents", p.slice(10));
-  if (p.startsWith("Downloads/")) return path.join(os.homedir(), "Downloads", p.slice(10));
+  if (p.startsWith("~/")) return path.join(os.homedir(), p.slice(2));
+  if (p.startsWith("Desktop/")) return path.join(os.homedir(), "Desktop", p.slice(8));
   return p;
 }
 
-// ── JSON parsing with auto-fix ────────────────────────────
-function parseActions(text) {
-  if (!text) return null;
-  let clean = text.replace(/```json\s*/gi,"").replace(/```\s*/g,"").trim();
-  const start = clean.indexOf("[");
-  const end   = clean.lastIndexOf("]");
-  if (start === -1 || end === -1) return null;
-  try {
-    const parsed = JSON.parse(clean.slice(start, end+1));
-    return Array.isArray(parsed) ? parsed : null;
-  } catch {
-    try {
-      const fixed = clean.slice(start, end+1)
-        .replace(/,\s*]/g,"]").replace(/,\s*}/g,"}")
-        .replace(/(['"])?([a-zA-Z_]\w*)(['"])?:/g,'"$2":');
-      const parsed = JSON.parse(fixed);
-      return Array.isArray(parsed) ? parsed : null;
-    } catch { return null; }
-  }
+async function openApp(appName) {
+  const p = os.platform();
+  const map = {
+    chrome:   { win32:"start chrome", darwin:"open -a 'Google Chrome'", linux:"google-chrome &" },
+    firefox:  { win32:"start firefox", darwin:"open -a Firefox", linux:"firefox &" },
+    vscode:   { win32:"start code", darwin:"open -a 'Visual Studio Code'", linux:"code &" },
+    terminal: { win32:"start cmd", darwin:"open -a Terminal", linux:"x-terminal-emulator &" },
+    explorer: { win32:"start explorer", darwin:"open ~", linux:"nautilus ~ &" },
+    notepad:  { win32:"start notepad", darwin:"open -a TextEdit", linux:"gedit &" },
+  };
+  const cmd = map[appName?.toLowerCase()]?.[p];
+  execSync(cmd || (p === "win32" ? `start ${appName}` : `open -a "${appName}"`), { shell: true });
 }
 
-// ── AI call with CoT + retry ──────────────────────────────
-async function callLocalAI(command, screenshotBase64, modelConfig, taskType, retryCount = 0) {
-  const { ollamaId, visionOllamaId, visionEnabled } = modelConfig;
-  const username  = os.userInfo().username;
-  const MAX_RETRY = 3;
-
-  const retryNote = retryCount > 0
-    ? `\n⚠️ RETRY ${retryCount}/${MAX_RETRY}: Previous response was not valid JSON. Output ONLY a JSON array starting with [ and ending with ].`
-    : "";
-
-  const userContent = `Task: "${command}"
-
-System: ${os.platform()==="win32"?"Windows":os.platform()==="darwin"?"macOS":"Linux"}
-Username: ${username}
-Desktop: ${path.join(os.homedir(),"Desktop")}
-Home: ${os.homedir()}
-Task type: ${taskType}
-${retryNote}
-
-Output ONLY a valid JSON array.`;
-
-  try {
-    const systemPrompt = buildSystemPrompt(taskType);
-    let text = "";
-
-    if (visionEnabled && visionOllamaId && screenshotBase64) {
-      text = await runOllamaVision(visionOllamaId, systemPrompt, `Screen shown.\n${userContent}`, screenshotBase64);
-    } else {
-      text = await runOllamaPrompt(ollamaId, systemPrompt, userContent);
-    }
-
-    console.log(`AI response (attempt ${retryCount+1}):`, text.slice(0,150));
-    const actions = parseActions(text);
-
-    if (!actions) {
-      if (retryCount < MAX_RETRY) {
-        console.warn(`⚠️ Invalid JSON attempt ${retryCount+1} — retrying...`);
-        await new Promise(r => setTimeout(r, 1000));
-        return callLocalAI(command, screenshotBase64, modelConfig, taskType, retryCount+1);
-      }
-      return null;
-    }
-    return actions;
-
-  } catch (err) {
-    console.error("AI call error:", err.message);
-    if (retryCount < MAX_RETRY) {
-      await new Promise(r => setTimeout(r, 2000));
-      return callLocalAI(command, screenshotBase64, modelConfig, taskType, retryCount+1);
-    }
-    return null;
-  }
-}
-
-// ── Execute actions ───────────────────────────────────────
-async function executeActions(actions) {
+// ── Execute Actions ────────────────────────────────────────
+async function executeActions(actions, modelConfig, workspaceId, firebaseConfig, onTeamProgress) {
   const results = [];
 
   for (const action of actions) {
-    const name = action.action;
-    console.log(`▶ ${name}${action.url?" → "+action.url:action.app?" → "+action.app:action.path?" → "+action.path:""}`);
+    console.log(`▶ ${action.action}${action.url ? " → " + action.url : action.path ? " → " + action.path : ""}`);
 
     try {
       let output = null;
 
-      if (name==="done"||name==="error") { results.push({success:true,action,output:action.message}); break; }
-      else if (name==="open")           await openApp(action.app);
-      else if (name==="click")          await mouseClick(action.x,action.y);
-      else if (name==="type")           await typeText(action.text);
-      else if (name==="key")            await pressKey(action.key);
-      else if (name==="wait")           await new Promise(r=>setTimeout(r,Math.min(action.ms||500,10000)));
-      else if (name==="scroll")         await scrollPage(action.x||500,action.y||300,action.direction,action.amount);
-      else if (name==="screenshot")     output = await takeScreenshot();
-      else if (name==="write_file") {
-        // Permission check for existing files
-        if (_workspaceId && _firebaseConfig) {
-          const perm = await checkAndRequestPermission("write_file",{path:action.path},_workspaceId,_firebaseConfig,_chatContext);
-          if (!perm.allowed && perm.reason) { results.push({success:false,action,error:perm.reason}); continue; }
-        }
-        output = await writeFile(action.path,action.content);
+      // ── Special Agent Actions ───────────────────────────
+      if (action.action === "assemble_team") {
+        const teamResult = await executeTeam(
+          action.task,
+          modelConfig,
+          (progress) => onTeamProgress?.(progress)
+        );
+        output = teamResult.output;
+        results.push({ success: true, action, output });
+        break;
       }
-      else if (name==="read_file")      output = readFile(action.path);
-      else if (name==="run_command")    output = await runCommand(action.command);
-      else if (name==="browser_goto")          output = await browserGoto(action.url,action.waitUntil);
-      else if (name==="browser_click")         await browserClick(action.selector,action.options);
-      else if (name==="browser_type")          await browserType(action.selector,action.text,action.clear);
-      else if (name==="browser_fill")          await browserFill(action.selector,action.text);
-      else if (name==="browser_wait")          await browserWait(action.selector,action.state,action.timeout);
-      else if (name==="browser_extract")       output = await browserExtract(action.selector,action.what);
-      else if (name==="browser_extract_table") output = await browserExtractTable(action.selector);
-      else if (name==="browser_screenshot")    output = await browserScreenshot(action.selector);
-      else if (name==="browser_key")           await browserKey(action.key);
-      else if (name==="browser_select")        await browserSelect(action.selector,action.value);
-      else if (name==="browser_scroll")        await browserScroll(action.direction,action.amount);
-      else if (name==="browser_hover")         await browserHover(action.selector);
-      else if (name==="browser_exists")        output = await browserExists(action.selector,action.timeout);
-      else if (name==="browser_eval")          output = await browserEval(action.script);
-      else if (name==="browser_new_tab")       await browserNewTab(action.url);
-      else if (name==="browser_login")         await browserSmartLogin(action.site,action.username,action.password);
-      else if (name==="github_auth")           output = await githubAuth(action.token);
-      else if (name==="github_list_repos")     output = await githubListRepos();
-      else if (name==="github_list_files")     output = await githubListFiles(action.owner,action.repo,action.path||"");
-      else if (name==="github_read_file")      output = await githubReadFile(action.owner,action.repo,action.path,action.branch);
-      else if (name==="github_write_file")     output = await githubWriteFile(action.owner,action.repo,action.path,action.content,action.message,action.branch);
-      else if (name==="github_delete_file")    output = await githubDeleteFile(action.owner,action.repo,action.path,action.message);
-      else if (name==="github_create_repo")    output = await githubCreateRepo(action.name,action.description,action.private);
-      else if (name==="github_create_branch")  output = await githubCreateBranch(action.owner,action.repo,action.branch,action.from);
-      else if (name==="github_create_pr")      output = await githubCreatePR(action.owner,action.repo,action.title,action.body,action.head,action.base);
-      else if (name==="github_list_issues")    output = await githubListIssues(action.owner,action.repo,action.state);
-      else if (name==="github_create_issue")   output = await githubCreateIssue(action.owner,action.repo,action.title,action.body,action.labels);
-      else if (name==="github_search")         output = await githubSearch(action.query,action.owner,action.repo);
-      else if (name==="github_clone")          output = await githubCloneLocally(action.owner,action.repo,action.target);
-      else if (name==="github_commit_multiple") output = await githubCommitMultiple(action.owner,action.repo,action.files,action.message,action.branch);
-      else console.warn(`⚠️ Unknown action: ${name}`);
 
-      results.push({success:true,action,output});
-      const noDelay = ["write_file","read_file","github_read_file","github_write_file","wait"];
-      if (!noDelay.includes(name)) await new Promise(r=>setTimeout(r,200));
+      if (action.action === "start_business_setup") {
+        output = "BUSINESS_SETUP_STARTED";
+        results.push({ success: true, action, output });
+        break;
+      }
+
+      if (action.action === "generate_briefing") {
+        const briefing = await generateMorningBriefing(modelConfig, null);
+        output = briefing ? JSON.stringify(briefing) : "Briefing generation failed";
+        results.push({ success: true, action, output });
+        break;
+      }
+
+      if (action.action === "scan_opportunities") {
+        const opps = await scanForOpportunities(modelConfig, null);
+        output = opps ? JSON.stringify(opps) : "No opportunities found";
+        results.push({ success: true, action, output });
+        break;
+      }
+
+      // ── PC Actions ──────────────────────────────────────
+      if (action.action === "open")         await openApp(action.app);
+      else if (action.action === "wait")    await new Promise(r => setTimeout(r, action.ms || 500));
+      else if (action.action === "write_file")  output = await writeFile(resolvePath(action.path), action.content);
+      else if (action.action === "read_file")   output = readFile(resolvePath(action.path));
+      else if (action.action === "run_command") output = await runCommand(action.command);
+      else if (action.action === "screenshot")  output = await takeScreenshot();
+
+      // ── Browser Actions ─────────────────────────────────
+      else if (action.action === "browser_goto")          output = await browserGoto(action.url, action.waitUntil);
+      else if (action.action === "browser_click")         await browserClick(action.selector, action.options);
+      else if (action.action === "browser_type")          await browserType(action.selector, action.text, action.clear);
+      else if (action.action === "browser_fill")          await browserFill(action.selector, action.text);
+      else if (action.action === "browser_wait")          await browserWait(action.selector, action.state, action.timeout);
+      else if (action.action === "browser_extract")       output = await browserExtract(action.selector, action.what);
+      else if (action.action === "browser_extract_table") output = await browserExtractTable(action.selector);
+      else if (action.action === "browser_screenshot")    output = await browserScreenshot(action.selector);
+      else if (action.action === "browser_key")           await browserKey(action.key);
+      else if (action.action === "browser_select")        await browserSelect(action.selector, action.value);
+      else if (action.action === "browser_scroll")        await browserScroll(action.direction, action.amount);
+      else if (action.action === "browser_hover")         await browserHover(action.selector);
+      else if (action.action === "browser_eval")          output = await browserEval(action.script);
+      else if (action.action === "browser_new_tab")       await browserNewTab(action.url);
+
+      // ── GitHub Actions ──────────────────────────────────
+      else if (action.action === "github_auth")           output = await githubAuth(action.token);
+      else if (action.action === "github_list_repos")     output = await githubListRepos();
+      else if (action.action === "github_read_file")      output = await githubReadFile(action.owner, action.repo, action.path, action.branch);
+      else if (action.action === "github_write_file")     output = await githubWriteFile(action.owner, action.repo, action.path, action.content, action.message, action.branch);
+      else if (action.action === "github_create_repo")    output = await githubCreateRepo(action.name, action.description, action.private);
+      else if (action.action === "github_create_branch")  output = await githubCreateBranch(action.owner, action.repo, action.branch, action.from);
+      else if (action.action === "github_create_pr")      output = await githubCreatePR(action.owner, action.repo, action.title, action.body, action.head, action.base);
+      else if (action.action === "github_list_issues")    output = await githubListIssues(action.owner, action.repo, action.state);
+      else if (action.action === "github_create_issue")   output = await githubCreateIssue(action.owner, action.repo, action.title, action.body, action.labels);
+      else if (action.action === "github_search")         output = await githubSearch(action.query, action.owner, action.repo);
+      else if (action.action === "github_clone")          output = await githubCloneLocally(action.owner, action.repo, action.target);
+      else if (action.action === "github_commit_multiple") output = await githubCommitMultiple(action.owner, action.repo, action.files, action.message, action.branch);
+
+      results.push({ success: true, action, output });
+      if (action.action === "done" || action.action === "error") break;
+
+      const noDelay = ["write_file","read_file","github_read_file","github_write_file","github_list_repos","github_commit_multiple"];
+      if (!noDelay.includes(action.action)) {
+        await new Promise(r => setTimeout(r, 300));
+      }
 
     } catch (err) {
-      console.error(`❌ ${name}: ${err.message}`);
-      results.push({success:false,action,error:err.message});
+      console.error(`❌ ${action.action}: ${err.message}`);
+      results.push({ success: false, action, error: err.message });
     }
   }
+
   return results;
 }
 
-// ── Main execute ──────────────────────────────────────────
-async function executeCommand(command, modelConfig) {
-  console.log(`\n🎯 Command: "${command}"`);
+// ── Handle Business DNA Setup Conversation ─────────────────
+async function handleBusinessSetup(command, setupState) {
+  const { currentQuestion, answers, dna: dnaInProgress } = setupState;
+  const questions = SETUP_QUESTIONS;
 
-  // Detect task type
-  const taskType    = detectTaskType(command);
-  const bestConfig  = selectModelForTask(taskType, modelConfig);
-  console.log(`   Task type: ${taskType} | Model: ${bestConfig.ollamaId}`);
+  // First time
+  if (!setupState.inProgress) {
+    const newState = {
+      inProgress: true,
+      currentQuestion: 0,
+      answers: {},
+      dna: null,
+    };
+    saveSetupState(newState);
 
-  // Check for existing skill
-  const existingSkill = getSkillForCommand(command);
-  if (existingSkill && !existingSkill.stale) {
-    console.log(`⚡ Skill match: ${existingSkill.name}`);
-  }
-
-  const screenshot = modelConfig.visionEnabled ? await takeScreenshot() : null;
-  const actions    = await callLocalAI(command, screenshot, bestConfig, taskType);
-
-  if (!actions || actions.length === 0) {
+    const q = questions[0];
     return {
-      success: false,
-      message: "Could not understand this command after 3 attempts. Please rephrase and try again.",
+      setupInProgress: true,
+      message: `🧬 Let's set up your Business DNA!\n\nThis takes about 5 minutes and I'll never ask again. I'll remember everything forever.\n\n**Question 1/${questions.length}:**\n${q.question}\n\n💡 ${q.example}`,
+      questionIndex: 0,
     };
   }
 
-  console.log(`   ${actions.length} actions planned`);
-  const results = await executeActions(actions);
+  // Save answer to current question
+  const q = questions[currentQuestion];
+  const updatedAnswers = { ...answers, [q.id]: command };
 
-  const doneAction  = results.find(r => r.action?.action === "done");
-  const errorAction = results.find(r => r.action?.action === "error");
-  const success     = !errorAction && results.some(r => r.success);
-  const message     = doneAction?.output || errorAction?.action?.message || "Task completed";
+  // Load or create DNA
+  const { loadDNA: loadCurrentDNA } = require("./businessDNA");
+  let dna = loadCurrentDNA();
+  dna = processSetupAnswer(q.id, command, dna);
 
-  // Learn
-  extractLearnings(command, actions, success);
-  const shouldCreate = shouldCreateSkill(command, actions, success);
-  if (shouldCreate) {
-    generateSkill(command, actions, { message, success });
-    console.log(`⚡ Skill generated for: "${command}"`);
+  // Check if more questions
+  const nextQuestion = currentQuestion + 1;
+
+  if (nextQuestion >= questions.length) {
+    // Setup complete
+    dna = completeSetup(dna);
+    clearSetupState();
+
+    const dnaData = loadCurrentDNA();
+    return {
+      setupInProgress: false,
+      setupComplete: true,
+      message: `🎉 Business DNA stored!\n\n**${dnaData.business?.name}** — I now know everything about your business.\n\nAs your ${dnaData.agentRole || "CEO"}, I'll:\n→ Brief you every morning\n→ Monitor your space\n→ Assemble teams for complex tasks\n→ Work proactively 24/7\n\nTry: *"Brief me on today"* or *"Create a marketing campaign for my launch"*`,
+      dna: dnaData,
+    };
   }
-  saveSession([{ command, success, message }], results);
 
-  const browserShot = results.find(r => r.action?.action==="browser_screenshot" && r.output)?.output;
-  const finalShot   = modelConfig.visionEnabled ? await takeScreenshot() : null;
+  // Next question
+  const newState = {
+    inProgress: true,
+    currentQuestion: nextQuestion,
+    answers: updatedAnswers,
+    dna: null,
+  };
+  saveSetupState(newState);
 
-  return { success, message, results, screenshot: browserShot || finalShot, taskType };
+  const nextQ = questions[nextQuestion];
+  return {
+    setupInProgress: true,
+    message: `✅ Got it!\n\n**Question ${nextQuestion + 1}/${questions.length}:**\n${nextQ.question}\n\n💡 ${nextQ.example}`,
+    questionIndex: nextQuestion,
+    options: nextQ.options || null,
+  };
 }
 
-module.exports = { executeCommand, takeScreenshot, writeFile, setAgentContext };
+// ── Format Briefing Response ───────────────────────────────
+function formatBriefing(briefing) {
+  if (!briefing) return "Could not generate briefing.";
+
+  let msg = `☀️ **Good morning from ${briefing.agentName}**\n\n`;
+  msg += `${briefing.greeting}\n\n`;
+
+  if (briefing.alerts?.length) {
+    msg += `**🔔 Alerts:**\n`;
+    briefing.alerts.forEach(a => {
+      const icon = a.type === "warning" ? "⚠️" : a.type === "opportunity" ? "🎯" : "ℹ️";
+      msg += `${icon} **${a.title}**\n${a.description}\n→ ${a.action}\n\n`;
+    });
+  }
+
+  if (briefing.tasksForToday?.length) {
+    msg += `**📋 Today's priorities:**\n`;
+    briefing.tasksForToday.forEach((t, i) => {
+      msg += `${i + 1}. ${t.task}\n   ↳ ${t.reason}\n`;
+    });
+    msg += "\n";
+  }
+
+  if (briefing.strategicInsight) {
+    msg += `**💡 Strategic insight:**\n${briefing.strategicInsight}\n\n`;
+  }
+
+  if (briefing.motivationalNote) {
+    msg += `*${briefing.motivationalNote}* 👹`;
+  }
+
+  return msg;
+}
+
+// ── Format Opportunities ───────────────────────────────────
+function formatOpportunities(opps) {
+  if (!opps?.length) return "No immediate opportunities found.";
+
+  let msg = `🎯 **Opportunities I found for you:**\n\n`;
+  opps.forEach((o, i) => {
+    const effortColor = o.effort === "low" ? "🟢" : o.effort === "medium" ? "🟡" : "🔴";
+    msg += `**${i + 1}. ${o.title}** ${effortColor}\n`;
+    msg += `${o.description}\n`;
+    msg += `→ First step: *${o.firstStep}*\n`;
+    msg += `Impact: ${o.impact} | Effort: ${o.effort}\n\n`;
+  });
+
+  return msg;
+}
+
+// ── Main Execute Command ───────────────────────────────────
+async function executeCommand(command, modelConfig, workspaceId, firebaseConfig) {
+  console.log(`\n🎯 "${command}"`);
+
+  // ── Check Business Setup Flow ──────────────────────────
+  const setupState = loadSetupState();
+
+  // Mid-setup conversation
+  if (setupState.inProgress) {
+    const result = await handleBusinessSetup(command, setupState);
+    return {
+      success: true,
+      message: result.message,
+      isSetupFlow: true,
+      setupComplete: result.setupComplete || false,
+      options: result.options || null,
+    };
+  }
+
+  // User wants to start setup
+  if (isBusinessSetupRequest(command)) {
+    const result = await handleBusinessSetup(command, { inProgress: false });
+    return {
+      success: true,
+      message: result.message,
+      isSetupFlow: true,
+      options: result.options || null,
+    };
+  }
+
+  // ── Briefing Request ────────────────────────────────────
+  if (isBriefingRequest(command)) {
+    console.log("   → Generating daily briefing...");
+    const briefing = await generateMorningBriefing(modelConfig, null);
+    return {
+      success: true,
+      message: formatBriefing(briefing),
+      isBriefing: true,
+    };
+  }
+
+  // ── Team Request ────────────────────────────────────────
+  if (isTeamRequest(command)) {
+    console.log("   → Assembling multi-agent team...");
+    const teamResult = await executeTeam(command, modelConfig, (progress) => {
+      console.log(`   Team: ${progress.message}`);
+    });
+    return {
+      success: teamResult.success,
+      message: teamResult.message,
+      output: teamResult.output,
+      isTeamTask: true,
+      teamName: teamResult.teamName,
+      agents: teamResult.agents,
+    };
+  }
+
+  // ── Standard Command Execution ──────────────────────────
+  const screenshot = modelConfig.visionEnabled ? await takeScreenshot() : null;
+  const systemPrompt = buildSystemPrompt(modelConfig);
+
+  const userContent = `User command: "${command}"\n\nRespond ONLY with a valid JSON array of actions. No explanation.`;
+
+  let actions = null;
+  let attempts = 0;
+
+  while (!actions && attempts < 3) {
+    attempts++;
+    try {
+      let text = "";
+      if (modelConfig.visionEnabled && modelConfig.visionOllamaId && screenshot) {
+        text = await runOllamaVision(modelConfig.visionOllamaId, systemPrompt, `Current screen above.\n${userContent}`, screenshot);
+      } else {
+        text = await runOllamaPrompt(modelConfig.ollamaId, systemPrompt, userContent);
+      }
+      const match = text.match(/\[[\s\S]*\]/);
+      if (match) actions = JSON.parse(match[0]);
+    } catch (err) {
+      console.error(`Attempt ${attempts} failed: ${err.message}`);
+    }
+  }
+
+  if (!actions || actions.length === 0) {
+    return { success: false, message: "AI could not determine actions. Please rephrase your command." };
+  }
+
+  console.log(`   ${actions.length} actions planned`);
+
+  const results   = await executeActions(actions, modelConfig, workspaceId, firebaseConfig, null);
+  const done      = results.find(r => r.action?.action === "done");
+  const error     = results.find(r => r.action?.action === "error");
+  const pcShot    = modelConfig.visionEnabled ? await takeScreenshot() : null;
+  const browserShot = results.find(r => r.action?.action === "browser_screenshot" && r.output)?.output;
+
+  // Update memory
+  if (done) {
+    updateMemory({
+      type: "task",
+      command,
+      result: done.action?.message || "Done",
+      success: true,
+      timestamp: Date.now(),
+    });
+  }
+
+  return {
+    success:      !error,
+    message:      done?.action?.message || error?.action?.message || "Task executed",
+    output:       done?.action?.output  || null,
+    results,
+    screenshot:   browserShot || pcShot,
+  };
+}
+
+module.exports = { executeCommand, takeScreenshot, writeFile, handleBusinessSetup, formatBriefing };
