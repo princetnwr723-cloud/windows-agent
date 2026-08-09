@@ -1,380 +1,318 @@
-// src/agent/listener.js
-// ✅ Firebase Realtime Database — WebSocket persistent connection
-// ✅ Zero polling — server pushes instantly
-// ✅ Rate limiting + ownership verification
-// ✅ Skills sync to RTDB for workspace UI
+// src/agent/listener-v2.js
+// Complete listener with Multi-Agent + Business DNA + Proactive
 
-const { executeCommand, setAgentContext } = require("./brain");
-const { listSkills }                       = require("./skills");
-const { loadMemory }                       = require("./memory");
-const https                                = require("https");
-const http                                 = require("http");
+const { executeCommand }           = require("./brain-v2");
+const { isDNASetup, loadDNA, saveDNA } = require("./businessDNA");
+const { generateMorningBriefing, monitorCompetitors, scanForOpportunities, generateWeeklyReport } = require("./proactiveAgent");
+const { executeTeam }              = require("./multiAgent");
 
-const MAX_PER_MIN  = 20;
-const rateLimiter  = new Map();
+const POLL_INTERVAL = 3000;
 
-function isRateLimited(userId) {
-  if (!userId) return false;
-  const now  = Date.now();
-  const data = rateLimiter.get(userId) || { count: 0, resetAt: now + 60000 };
-  if (now > data.resetAt) { data.count = 0; data.resetAt = now + 60000; }
-  data.count++;
-  rateLimiter.set(userId, data);
-  return data.count > MAX_PER_MIN;
+// ── RTDB REST helpers ──────────────────────────────────────
+function rtdbUrl(firebaseConfig, path) {
+  return `https://${firebaseConfig.projectId}-default-rtdb.firebaseio.com/${path}.json`;
 }
 
-// ── RTDB REST helpers ─────────────────────────────────────
-function rtdbGet(rtdbUrl, path, apiKey) {
-  return new Promise((resolve, reject) => {
-    const url = `${rtdbUrl}${path}.json?auth=${apiKey}`;
-    const mod  = url.startsWith("https") ? https : http;
-    mod.get(url, (res) => {
-      let data = "";
-      res.on("data", c => data += c);
-      res.on("end", () => {
-        try { resolve(JSON.parse(data)); } catch { resolve(null); }
-      });
-    }).on("error", reject);
-  });
+async function rtdbGet(firebaseConfig, path) {
+  try {
+    const res  = await fetch(rtdbUrl(firebaseConfig, path));
+    return res.ok ? await res.json() : null;
+  } catch { return null; }
 }
 
-function rtdbSet(rtdbUrl, path, data, apiKey, method = "PUT") {
-  return new Promise((resolve, reject) => {
-    const body    = JSON.stringify(data);
-    const urlObj  = new URL(`${rtdbUrl}${path}.json?auth=${apiKey}`);
-    const options = {
-      hostname: urlObj.hostname,
-      path:     urlObj.pathname + urlObj.search,
-      method,
-      headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) },
-    };
-    const mod = urlObj.protocol === "https:" ? https : http;
-    const req = mod.request(options, (res) => {
-      let d = "";
-      res.on("data", c => d += c);
-      res.on("end", () => resolve(JSON.parse(d || "null")));
+async function rtdbSet(firebaseConfig, path, data) {
+  try {
+    await fetch(rtdbUrl(firebaseConfig, path), {
+      method:  "PUT",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify(data),
     });
-    req.on("error", reject);
-    req.write(body);
-    req.end();
-  });
+  } catch {}
 }
 
-function rtdbPatch(rtdbUrl, path, data, apiKey) {
-  return rtdbSet(rtdbUrl, path, data, apiKey, "PATCH");
+async function rtdbPatch(firebaseConfig, path, data) {
+  try {
+    await fetch(rtdbUrl(firebaseConfig, path), {
+      method:  "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify(data),
+    });
+  } catch {}
 }
 
-function rtdbDelete(rtdbUrl, path, apiKey) {
-  return new Promise((resolve, reject) => {
-    const urlObj  = new URL(`${rtdbUrl}${path}.json?auth=${apiKey}`);
-    const options = { hostname: urlObj.hostname, path: urlObj.pathname + urlObj.search, method: "DELETE" };
-    const mod = urlObj.protocol === "https:" ? https : http;
-    const req = mod.request(options, (res) => { res.on("data", () => {}); res.on("end", resolve); });
-    req.on("error", reject);
-    req.end();
-  });
-}
-
-// ── Firebase Realtime Database SSE listener ───────────────
-// RTDB supports Server-Sent Events for real-time pushes
-function listenRTDB(rtdbUrl, path, apiKey, onData) {
-  const url     = `${rtdbUrl}${path}.json?auth=${apiKey}`;
-  const urlObj  = new URL(url);
-  const options = {
-    hostname: urlObj.hostname,
-    path:     urlObj.pathname + urlObj.search,
-    method:   "GET",
-    headers:  { "Accept": "text/event-stream", "Cache-Control": "no-cache" },
+// ── Send team progress to RTDB ─────────────────────────────
+function makeTeamProgressSender(workspaceId, firebaseConfig) {
+  return async (progress) => {
+    await rtdbSet(firebaseConfig, `workspaces/${workspaceId}/teamProgress`, progress);
   };
-
-  const mod = urlObj.protocol === "https:" ? https : http;
-  let req   = null;
-  let retry = 1000;
-
-  function connect() {
-    req = mod.request(options, (res) => {
-      retry = 1000; // reset backoff on successful connection
-      let buffer = "";
-
-      res.on("data", (chunk) => {
-        buffer += chunk.toString();
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
-
-        let event = null;
-        let dataStr = "";
-
-        for (const line of lines) {
-          if (line.startsWith("event: ")) {
-            event = line.slice(7).trim();
-          } else if (line.startsWith("data: ")) {
-            dataStr = line.slice(6).trim();
-          } else if (line === "" && event && dataStr) {
-            try {
-              const parsed = JSON.parse(dataStr);
-              onData(event, parsed);
-            } catch {}
-            event   = null;
-            dataStr = "";
-          }
-        }
-      });
-
-      res.on("end", () => {
-        console.warn("⚠️ RTDB connection closed — reconnecting...");
-        setTimeout(connect, retry);
-        retry = Math.min(retry * 2, 30000);
-      });
-
-      res.on("error", () => {
-        setTimeout(connect, retry);
-        retry = Math.min(retry * 2, 30000);
-      });
-    });
-
-    req.on("error", () => {
-      setTimeout(connect, retry);
-      retry = Math.min(retry * 2, 30000);
-    });
-
-    req.end();
-  }
-
-  connect();
-  return () => { if (req) req.destroy(); };
 }
 
-// ── Main listener ─────────────────────────────────────────
-function startCommandListener(workspaceId, firebaseConfig, modelConfig) {
-  const { rtdbUrl, apiKey, projectId } = firebaseConfig;
+// ── Send setup flow message to RTDB ───────────────────────
+async function sendSetupFlow(workspaceId, firebaseConfig, data) {
+  await rtdbSet(firebaseConfig, `workspaces/${workspaceId}/setupFlow`, {
+    ...data,
+    sentAt: Date.now(),
+  });
+}
 
-  if (!rtdbUrl) {
-    console.error("❌ RTDB URL not set in config — cannot start listener");
-    return null;
+// ── Update chat message ────────────────────────────────────
+async function updateMessage(workspaceId, chatId, messageId, content, status, screenshot, firebaseConfig) {
+  const path = `workspaces/${workspaceId}/chats/${chatId}/messages/${messageId}`;
+  const data = { content, status, updatedAt: Date.now() };
+  if (screenshot) data.screenshot = screenshot;
+  await rtdbPatch(firebaseConfig, path, data);
+
+  // Also update lastMessage in chat
+  await rtdbPatch(firebaseConfig, `workspaces/${workspaceId}/chats/${chatId}`, {
+    lastMessage: content.slice(0, 100),
+    updatedAt: Date.now(),
+  });
+}
+
+// ── Sync Business DNA to RTDB ──────────────────────────────
+async function syncDNAToRTDB(workspaceId, firebaseConfig) {
+  const dna = loadDNA();
+  if (dna.setupComplete) {
+    await rtdbSet(firebaseConfig, `workspaces/${workspaceId}/businessDNA`, dna);
+    console.log("🧬 DNA synced to RTDB");
+  }
+}
+
+// ── Format result message ──────────────────────────────────
+function formatResult(result) {
+  if (!result) return "Task completed.";
+
+  // Team task
+  if (result.isTeamTask) {
+    return `👥 **${result.teamName}** completed!\n\n${result.output || result.message}`;
   }
 
-  console.log(`\n✅ RTDB Listener started (WebSocket — zero polling)`);
+  // Briefing
+  if (result.isBriefing) {
+    return result.message;
+  }
+
+  // Setup flow — handled separately
+  if (result.isSetupFlow) {
+    return result.message;
+  }
+
+  // Opportunities
+  if (Array.isArray(result.output)) {
+    return result.message + "\n\n" + JSON.stringify(result.output, null, 2);
+  }
+
+  return result.message || result.output || "Task completed.";
+}
+
+// ── Main Command Listener ──────────────────────────────────
+function startCommandListener(workspaceId, firebaseConfig, modelConfig) {
+  console.log(`\n✅ Command listener started (v2 — Multi-Agent + Business DNA)`);
   console.log(`   Workspace : ${workspaceId}`);
   console.log(`   Model     : ${modelConfig.ollamaId}`);
-  console.log(`   Vision    : ${modelConfig.visionEnabled ? "ON" : "OFF"}`);
+  console.log(`   DNA Setup : ${isDNASetup() ? "✅ " + loadDNA().business?.name : "❌ Not set"}`);
 
-  setAgentContext(workspaceId, firebaseConfig, {});
+  // Sync DNA on start
+  syncDNAToRTDB(workspaceId, firebaseConfig);
 
-  const processing = new Set();
-  let workspaceOwnerId = null;
+  // Sync DNA on startup
+  const dna = loadDNA();
+  if (dna.setupComplete) {
+    console.log(`   Business  : ${dna.business?.name} | Role: ${dna.agentRole}`);
+  }
 
-  // Get workspace owner
-  rtdbGet(rtdbUrl, `/workspaces/${workspaceId}`, apiKey)
-    .then(data => {
-      workspaceOwnerId = data?.userId || null;
-      console.log(`✅ Owner verified: ${workspaceOwnerId}`);
+  // ── Setup proactive scheduler ────────────────────────────
+  setupProactiveScheduler(workspaceId, firebaseConfig, modelConfig);
 
-      // Set agent online status
-      rtdbPatch(rtdbUrl, `/workspaces/${workspaceId}`, {
-        agentOnline:    true,
-        agentLastSeen:  Date.now(),
-        agentModel:     modelConfig.ollamaId,
-        agentVision:    modelConfig.visionEnabled,
-      }, apiKey);
-    })
-    .catch(() => console.warn("⚠️ Could not fetch workspace owner"));
+  // ── Main polling loop ────────────────────────────────────
+  const poll = setInterval(async () => {
+    try {
+      const commands = await rtdbGet(firebaseConfig, `workspaces/${workspaceId}/commands`);
+      if (!commands) return;
 
-  // Sync skills to RTDB so workspace UI can show them
-  syncSkillsToRTDB(rtdbUrl, workspaceId, apiKey);
+      for (const [docId, cmd] of Object.entries(commands)) {
+        if (!cmd || cmd.status !== "pending") continue;
 
-  // Sync memory summary
-  syncMemoryToRTDB(rtdbUrl, workspaceId, apiKey);
-
-  // ── Listen for new commands ─────────────────────────────
-  const stopCommands = listenRTDB(
-    rtdbUrl,
-    `/workspaces/${workspaceId}/commands`,
-    apiKey,
-    async (event, payload) => {
-      if (event !== "put" && event !== "patch") return;
-
-      const data = payload?.data;
-      if (!data || typeof data !== "object") return;
-
-      // payload.path is the command key or "/"
-      const commandPath = payload.path;
-      const commands    = commandPath === "/" ? data : { [commandPath.slice(1)]: data };
-
-      for (const [cmdKey, cmdData] of Object.entries(commands || {})) {
-        if (!cmdData || cmdData.status !== "pending") continue;
-        if (processing.has(cmdKey)) continue;
-
-        const command   = cmdData.command;
-        const chatId    = cmdData.chatId;
-        const messageId = cmdData.messageId;
-        const cmdUserId = cmdData.userId;
+        const command   = cmd.command;
+        const chatId    = cmd.chatId;
+        const messageId = cmd.messageId;
+        const isSetup   = cmd.isSetupFlow;
 
         if (!command) continue;
 
-        // Security: ownership check
-        if (workspaceOwnerId && cmdUserId && cmdUserId !== workspaceOwnerId) {
-          console.error(`❌ Command from wrong user — rejecting`);
-          await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/commands/${cmdKey}/status`, "rejected", apiKey);
-          continue;
-        }
-
-        // Rate limit
-        if (isRateLimited(cmdUserId || workspaceOwnerId)) {
-          console.warn(`⚠️ Rate limited`);
-          await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/commands/${cmdKey}/status`, "rate_limited", apiKey);
-          if (chatId && messageId) {
-            await updateMessage(rtdbUrl, workspaceId, chatId, messageId,
-              "⚠️ Too many commands — please wait a moment.", "error", null, apiKey);
-          }
-          continue;
-        }
-
-        processing.add(cmdKey);
-        console.log(`\n🎯 Command received: "${command}"`);
-
-        // Update context for permissions
-        setAgentContext(workspaceId, firebaseConfig, { chatId, messageId });
+        console.log(`\n🎯 "${command}"`);
 
         // Mark processing
-        await rtdbPatch(rtdbUrl, `/workspaces/${workspaceId}/commands/${cmdKey}`, {
-          status:    "processing",
-          startedAt: Date.now(),
-        }, apiKey);
+        await rtdbPatch(firebaseConfig, `workspaces/${workspaceId}/commands/${docId}`, {
+          status: "processing",
+        });
 
-        // Execute
-        executeCommand(command, modelConfig)
-          .then(async (result) => {
-            if (chatId && messageId) {
-              await updateMessage(rtdbUrl, workspaceId, chatId, messageId,
-                result.message || "Done!", result.success ? "done" : "error",
-                result.screenshot, apiKey);
-            }
-            await rtdbPatch(rtdbUrl, `/workspaces/${workspaceId}/commands/${cmdKey}`, {
-              status:      "completed",
-              completedAt: Date.now(),
-            }, apiKey);
+        try {
+          // Execute command (brain-v2 handles all routing)
+          const result = await executeCommand(
+            command,
+            modelConfig,
+            workspaceId,
+            firebaseConfig,
+          );
 
-            if (result.screenshot) {
-              await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/liveView`, {
-                screenshot: result.screenshot,
-                takenAt:    Date.now(),
-              }, apiKey);
-            }
+          // Handle setup flow
+          if (result.isSetupFlow) {
+            await sendSetupFlow(workspaceId, firebaseConfig, {
+              message: result.message,
+              options: result.options || null,
+              setupComplete: result.setupComplete || false,
+              dna: result.setupComplete ? loadDNA() : null,
+            });
 
-            // Re-sync skills after task (might have learned new ones)
-            syncSkillsToRTDB(rtdbUrl, workspaceId, apiKey);
-          })
-          .catch(async (err) => {
-            console.error(`❌ Execute error: ${err.message}`);
-            if (chatId && messageId) {
-              await updateMessage(rtdbUrl, workspaceId, chatId, messageId,
-                `Failed: ${err.message}`, "error", null, apiKey);
+            // Sync DNA if setup complete
+            if (result.setupComplete) {
+              await syncDNAToRTDB(workspaceId, firebaseConfig);
             }
-            await rtdbPatch(rtdbUrl, `/workspaces/${workspaceId}/commands/${cmdKey}`, {
-              status: "failed",
-            }, apiKey);
-          })
-          .finally(() => {
-            processing.delete(cmdKey);
-            // Clean up old completed commands (keep last 50)
-            cleanOldCommands(rtdbUrl, workspaceId, apiKey);
+          }
+
+          // Update chat message
+          if (chatId && messageId) {
+            const msg = formatResult(result);
+            await updateMessage(
+              workspaceId, chatId, messageId,
+              msg,
+              result.success ? "done" : "error",
+              result.screenshot || null,
+              firebaseConfig
+            );
+          }
+
+          // Save screenshot to live view
+          if (result.screenshot) {
+            await rtdbSet(firebaseConfig, `workspaces/${workspaceId}/liveView`, {
+              screenshot: result.screenshot,
+              takenAt: Date.now(),
+            });
+          }
+
+          // Mark completed
+          await rtdbPatch(firebaseConfig, `workspaces/${workspaceId}/commands/${docId}`, {
+            status: "completed",
+            completedAt: Date.now(),
           });
+
+        } catch (err) {
+          console.error(`❌ Error: ${err.message}`);
+          if (chatId && messageId) {
+            await updateMessage(
+              workspaceId, chatId, messageId,
+              `❌ Failed: ${err.message}`,
+              "error", null, firebaseConfig
+            );
+          }
+          await rtdbPatch(firebaseConfig, `workspaces/${workspaceId}/commands/${docId}`, {
+            status: "failed",
+            error: err.message,
+          });
+        }
       }
+    } catch (err) {
+      console.error(`❌ Listener error: ${err.message}`);
     }
-  );
+  }, POLL_INTERVAL);
 
-  // ── Listen for screenshot requests ──────────────────────
-  const stopScreenshot = listenRTDB(
-    rtdbUrl,
-    `/workspaces/${workspaceId}/screenshotRequest`,
-    apiKey,
-    async (event, payload) => {
-      if (!payload?.data?.requested) return;
-      console.log("📸 Screenshot requested from workspace");
-      const { takeScreenshot } = require("./brain");
-      const shot = await takeScreenshot();
-      if (shot) {
-        await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/liveView`, {
-          screenshot: shot,
-          takenAt:    Date.now(),
-        }, apiKey);
-      }
-      // Clear request
-      await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/screenshotRequest`, null, apiKey);
+  return poll;
+}
+
+// ── Proactive Scheduler ────────────────────────────────────
+function setupProactiveScheduler(workspaceId, firebaseConfig, modelConfig) {
+  const dna = loadDNA();
+  if (!dna.setupComplete) return;
+
+  console.log(`\n⏰ Proactive scheduler started for ${dna.business?.name}`);
+
+  // Morning briefing — 9:00 AM daily
+  scheduleDaily("09:00", async () => {
+    console.log("☀️ Generating morning briefing...");
+    const briefing = await generateMorningBriefing(modelConfig, async (key, data) => {
+      await rtdbSet(firebaseConfig, `workspaces/${workspaceId}/${key}`, data);
+    });
+    if (briefing) {
+      await rtdbSet(firebaseConfig, `workspaces/${workspaceId}/briefing`, briefing);
+      console.log("✅ Morning briefing sent to dashboard");
     }
-  );
+  });
 
-  // ── Heartbeat — keep agent online status ────────────────
-  const heartbeat = setInterval(async () => {
-    await rtdbPatch(rtdbUrl, `/workspaces/${workspaceId}`, {
-      agentOnline:   true,
-      agentLastSeen: Date.now(),
-    }, apiKey);
-  }, 30000); // every 30 seconds
-
-  // Return cleanup function
-  return () => {
-    stopCommands?.();
-    stopScreenshot?.();
-    clearInterval(heartbeat);
-    rtdbPatch(rtdbUrl, `/workspaces/${workspaceId}`, { agentOnline: false }, apiKey);
-  };
-}
-
-// ── Sync skills list to RTDB ──────────────────────────────
-async function syncSkillsToRTDB(rtdbUrl, workspaceId, apiKey) {
-  try {
-    const skills = listSkills();
-    const slim   = skills.slice(0, 20).map(s => ({
-      id:           s.id,
-      name:         s.name,
-      description:  s.description,
-      trigger:      s.trigger,
-      category:     s.category,
-      successCount: s.successCount || 0,
-      lastUsed:     s.lastUsed,
-    }));
-    await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/skills`, slim, apiKey);
-  } catch {}
-}
-
-// ── Sync memory summary to RTDB ───────────────────────────
-async function syncMemoryToRTDB(rtdbUrl, workspaceId, apiKey) {
-  try {
-    const mem = loadMemory();
-    await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/memorySummary`, {
-      totalTasks:  mem.agent?.totalTasksCompleted || 0,
-      sessions:    mem.sessionCount || 0,
-      factsCount:  (mem.facts || []).length,
-      skillsCount: 0,
-      userName:    mem.user?.name || null,
-      updatedAt:   Date.now(),
-    }, apiKey);
-  } catch {}
-}
-
-// ── Update message in RTDB ────────────────────────────────
-async function updateMessage(rtdbUrl, workspaceId, chatId, messageId, content, status, screenshot, apiKey) {
-  const update = { content, status, updatedAt: Date.now() };
-  if (screenshot) update.screenshot = screenshot;
-  await rtdbPatch(rtdbUrl, `/workspaces/${workspaceId}/chats/${chatId}/messages/${messageId}`, update, apiKey);
-}
-
-// ── Clean old commands ────────────────────────────────────
-async function cleanOldCommands(rtdbUrl, workspaceId, apiKey) {
-  try {
-    const cmds = await rtdbGet(rtdbUrl, `/workspaces/${workspaceId}/commands`, apiKey);
-    if (!cmds) return;
-    const entries = Object.entries(cmds)
-      .filter(([, v]) => v.status === "completed" || v.status === "failed")
-      .sort(([, a], [, b]) => (a.completedAt || 0) - (b.completedAt || 0));
-    if (entries.length > 50) {
-      const toDelete = entries.slice(0, entries.length - 50);
-      for (const [key] of toDelete) {
-        await rtdbDelete(rtdbUrl, `/workspaces/${workspaceId}/commands/${key}`, apiKey);
-      }
+  // Opportunity scan — Every 6 hours
+  scheduleInterval(6 * 60 * 60 * 1000, async () => {
+    console.log("🎯 Scanning for opportunities...");
+    const opps = await scanForOpportunities(modelConfig, async (key, data) => {
+      await rtdbSet(firebaseConfig, `workspaces/${workspaceId}/${key}`, data);
+    });
+    if (opps) {
+      await rtdbSet(firebaseConfig, `workspaces/${workspaceId}/opportunities`, {
+        items: opps,
+        scannedAt: Date.now(),
+      });
     }
-  } catch {}
+  });
+
+  // Weekly report — Every Monday 8:00 AM
+  scheduleWeekly(1, "08:00", async () => {
+    console.log("📊 Generating weekly report...");
+    const report = await generateWeeklyReport(modelConfig, async (key, data) => {
+      await rtdbSet(firebaseConfig, `workspaces/${workspaceId}/${key}`, data);
+    });
+    if (report) {
+      await rtdbSet(firebaseConfig, `workspaces/${workspaceId}/weeklyReport`, report);
+    }
+  });
+
+  // Heartbeat — every 30s
+  setInterval(async () => {
+    await rtdbPatch(firebaseConfig, `workspaces/${workspaceId}`, {
+      agentOnline:    true,
+      lastHeartbeat:  Date.now(),
+      agentModel:     modelConfig.ollamaId,
+      businessDNASet: dna.setupComplete,
+      businessName:   dna.business?.name || null,
+      agentRole:      dna.agentRole || null,
+    });
+  }, 30000);
 }
 
-module.exports = { startCommandListener, rtdbSet, rtdbGet, rtdbPatch, rtdbDelete, syncSkillsToRTDB };
+// ── Schedule Helpers ───────────────────────────────────────
+function scheduleDaily(timeStr, fn) {
+  const [h, m] = timeStr.split(":").map(Number);
+  function tick() {
+    const now  = new Date();
+    const next = new Date();
+    next.setHours(h, m, 0, 0);
+    if (next <= now) next.setDate(next.getDate() + 1);
+    const diff = next.getTime() - now.getTime();
+    setTimeout(() => { fn(); scheduleDaily(timeStr, fn); }, diff);
+    console.log(`⏰ Scheduled daily at ${timeStr} — in ${Math.round(diff / 60000)} min`);
+  }
+  tick();
+}
+
+function scheduleInterval(ms, fn) {
+  // Run after 5 min on startup, then every interval
+  setTimeout(() => {
+    fn();
+    setInterval(fn, ms);
+  }, 5 * 60 * 1000);
+}
+
+function scheduleWeekly(dayOfWeek, timeStr, fn) {
+  const [h, m] = timeStr.split(":").map(Number);
+  function tick() {
+    const now  = new Date();
+    const next = new Date();
+    const day  = now.getDay();
+    const diff = (dayOfWeek - day + 7) % 7;
+    next.setDate(now.getDate() + (diff === 0 ? 7 : diff));
+    next.setHours(h, m, 0, 0);
+    const ms = next.getTime() - now.getTime();
+    setTimeout(() => { fn(); tick(); }, ms);
+  }
+  tick();
+}
+
+module.exports = { startCommandListener };
