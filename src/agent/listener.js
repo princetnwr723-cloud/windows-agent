@@ -190,7 +190,7 @@ function setupProactiveScheduler(rtdbUrl, workspaceId, apiKey, modelConfig) {
   scheduleDaily("09:00", async () => {
     console.log("☀️ Generating morning briefing...");
     try {
-      const briefing = await generateMorningBriefing(modelConfig, null);
+      const briefing = await generateMorningBriefing(modelConfig);
       if (briefing) {
         await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/briefing`, briefing, apiKey);
         console.log("✅ Morning briefing sent");
@@ -201,14 +201,14 @@ function setupProactiveScheduler(rtdbUrl, workspaceId, apiKey, modelConfig) {
   // Opportunity scan — every 6 hours (first run after 5min)
   setTimeout(async () => {
     try {
-      const opps = await scanForOpportunities(modelConfig, null);
+      const opps = await scanForOpportunities(modelConfig);
       if (opps?.length) {
         await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/opportunities`, { items:opps, scannedAt:Date.now() }, apiKey);
       }
     } catch {}
     setInterval(async () => {
       try {
-        const opps = await scanForOpportunities(modelConfig, null);
+        const opps = await scanForOpportunities(modelConfig);
         if (opps?.length) {
           await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/opportunities`, { items:opps, scannedAt:Date.now() }, apiKey);
         }
@@ -219,7 +219,7 @@ function setupProactiveScheduler(rtdbUrl, workspaceId, apiKey, modelConfig) {
   // Weekly report — Monday 8am
   scheduleWeekly(1, "08:00", async () => {
     try {
-      const report = await generateWeeklyReport(modelConfig, null);
+      const report = await generateWeeklyReport(modelConfig);
       if (report) await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/weeklyReport`, report, apiKey);
     } catch {}
   });
