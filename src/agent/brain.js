@@ -495,7 +495,7 @@ async function executeCommand(command, modelConfig) {
 
   // ── 2. Morning briefing ────────────────────────────────
   if (isBriefingRequest(command)) {
-    const briefing = await generateMorningBriefing(modelConfig, null);
+    const briefing = await generateMorningBriefing(modelConfig);
     return {
       success: true,
       isBriefing: true,
@@ -505,7 +505,7 @@ async function executeCommand(command, modelConfig) {
 
   // ── 3. Opportunity scan ────────────────────────────────
   if (isOpportunityRequest(command)) {
-    const opps = await scanForOpportunities(modelConfig, null);
+    const opps = await scanForOpportunities(modelConfig);
     return {
       success: true,
       message: opps ? formatOpportunities(opps) : "No opportunities found right now.",
