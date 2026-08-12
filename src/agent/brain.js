@@ -16,6 +16,7 @@ const { checkAndRequestPermission, assessCommandRisk } = require("./permissions"
 const { buildBusinessPrompt, loadDNA, isDNASetup, SETUP_QUESTIONS, processSetupAnswer, completeSetup } = require("./businessDNA");
 const { executeTeam, needsTeam } = require("./multiAgent");
 const { generateMorningBriefing, scanForOpportunities } = require("./proactiveAgent");
+const { getBestConnector, callConnector } = require("./connectors");
 const {
   browserGoto, browserClick, browserType, browserFill,
   browserWait, browserExtract, browserExtractTable,
@@ -536,8 +537,32 @@ async function executeCommand(command, modelConfig) {
   const existingSkill = getSkillForCommand(command);
   if (existingSkill && !existingSkill.stale) console.log(`⚡ Skill match: ${existingSkill.name}`);
 
-  const screenshot = modelConfig.visionEnabled ? await takeScreenshot() : null;
-  const actions    = await callLocalAI(command, screenshot, bestConfig, taskType);
+  // ── Try API connector for complex tasks ─────────────────
+  const connector = await getBestConnector(taskType);
+  let actions = null;
+
+  if (connector && ["coding","reasoning","strategy","content","research"].includes(taskType)) {
+    console.log(`   🔀 Using connector: ${connector.name} (${connector.model})`);
+    try {
+      const systemPrompt = buildSystemPrompt(taskType);
+      const userContent  = `User command: "${command}"
+
+Respond ONLY with a valid JSON array of actions. No explanation.`;
+      const text         = await callConnector(connector, systemPrompt, userContent);
+      actions            = parseActions(text);
+      if (actions) console.log(`   ✅ Connector response parsed: ${actions.length} actions`);
+      else         console.log(`   ⚠️ Connector response invalid — falling back to local`);
+    } catch (err) {
+      console.error(`   ❌ Connector error: ${err.message} — falling back to local`);
+      actions = null;
+    }
+  }
+
+  // ── Fallback to local Ollama ──────────────────────────
+  if (!actions) {
+    const screenshot = modelConfig.visionEnabled ? await takeScreenshot() : null;
+    actions = await callLocalAI(command, screenshot, bestConfig, taskType);
+  }
 
   if (!actions || actions.length === 0) {
     return { success:false, message:"Could not understand this command after 3 attempts. Please rephrase and try again." };
