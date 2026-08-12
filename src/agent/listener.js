@@ -13,6 +13,7 @@ const { listSkills }                       = require("./skills");
 const { loadMemory }                       = require("./memory");
 const { isDNASetup, loadDNA }              = require("./businessDNA");
 const { generateMorningBriefing, monitorCompetitors, scanForOpportunities, generateWeeklyReport } = require("./proactiveAgent");
+const { handleConnectorAction, syncConnectorsToRTDB } = require("./connectorHandler");
 const https                                = require("https");
 const http                                 = require("http");
 
@@ -291,6 +292,7 @@ function startCommandListener(workspaceId, firebaseConfig, modelConfig) {
   syncSkillsToRTDB(rtdbUrl, workspaceId, apiKey);
   syncMemoryToRTDB(rtdbUrl, workspaceId, apiKey);
   syncDNAToRTDB(rtdbUrl, workspaceId, apiKey);
+  syncConnectorsToRTDB(workspaceId, (path, data) => rtdbSet(rtdbUrl, `/${path}`, data, apiKey));
 
   // Start proactive scheduler if DNA is set
   setupProactiveScheduler(rtdbUrl, workspaceId, apiKey, modelConfig);
@@ -410,6 +412,19 @@ function startCommandListener(workspaceId, firebaseConfig, modelConfig) {
       await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/liveView`, { screenshot:shot, takenAt:Date.now() }, apiKey);
     }
     await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/screenshotRequest`, null, apiKey);
+  });
+
+  // ── Connector Actions ────────────────────────────────────
+  listenRTDB(rtdbUrl, `/workspaces/${workspaceId}/connectorAction`, apiKey, async (event, payload) => {
+    if (!payload?.data) return;
+    await handleConnectorAction(
+      payload.data,
+      workspaceId,
+      (path, data) => rtdbSet(rtdbUrl, `/${path}`, data, apiKey),
+      (path, data) => rtdbPatch(rtdbUrl, `/${path}`, data, apiKey)
+    );
+    // Clear action after handling
+    await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/connectorAction`, null, apiKey);
   });
 
   // ── Heartbeat (original) ────────────────────────────────
