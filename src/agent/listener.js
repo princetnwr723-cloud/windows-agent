@@ -14,6 +14,7 @@ const { loadMemory }                       = require("./memory");
 const { isDNASetup, loadDNA }              = require("./businessDNA");
 const { generateMorningBriefing, monitorCompetitors, scanForOpportunities, generateWeeklyReport } = require("./proactiveAgent");
 const { handleConnectorAction, syncConnectorsToRTDB } = require("./connectorHandler");
+const { chatWithAgent, executeTeamTask, getAllAgentStatuses, getRecentLog, addToLog } = require("./teamAgent");
 const https                                = require("https");
 const http                                 = require("http");
 
@@ -294,6 +295,15 @@ function startCommandListener(workspaceId, firebaseConfig, modelConfig) {
   syncDNAToRTDB(rtdbUrl, workspaceId, apiKey);
   syncConnectorsToRTDB(workspaceId, (path, data) => rtdbSet(rtdbUrl, `/${path}`, data, apiKey));
 
+  // Sync agent statuses on startup
+  try {
+    const statuses = getAllAgentStatuses();
+    await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/agentStatuses`, statuses, apiKey);
+    const log = getRecentLog(30);
+    await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/activityLog`, log, apiKey);
+    console.log(`✅ Agent statuses synced: ${statuses.length} agents`);
+  } catch (err) { console.error("Agent sync error:", err.message); }
+
   // Start proactive scheduler if DNA is set
   setupProactiveScheduler(rtdbUrl, workspaceId, apiKey, modelConfig);
 
@@ -427,14 +437,61 @@ function startCommandListener(workspaceId, firebaseConfig, modelConfig) {
     await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/connectorAction`, null, apiKey);
   });
 
+  // ── Direct Agent Chat ────────────────────────────────────
+  listenRTDB(rtdbUrl, `/workspaces/${workspaceId}/agentDirectChat`, apiKey, async (event, payload) => {
+    if (!payload?.data) return;
+    const { agentId, message, messageId, sentAt } = payload.data;
+    if (!agentId || !message || Date.now() - (sentAt || 0) > 30000) return;
+
+    console.log(`\n💬 Direct chat → ${agentId}: "${message.slice(0,50)}"`);
+
+    try {
+      const result = await chatWithAgent(agentId, message, modelConfig);
+
+      // Update message in RTDB if messageId provided
+      if (messageId) {
+        await rtdbPatch(rtdbUrl, `/workspaces/${workspaceId}/agentChats/${agentId}/${messageId}`, {
+          content: result.output,
+          status:  "done",
+          updatedAt: Date.now(),
+        }, apiKey);
+      }
+
+      // Push new agent message
+      const msgKey = `msg_${Date.now()}`;
+      await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/agentChats/${agentId}/${msgKey}`, {
+        role:      "agent",
+        content:   result.output,
+        type:      result.type || "chat",
+        timestamp: Date.now(),
+        status:    "done",
+      }, apiKey);
+
+      // Sync updated agent status + log
+      const statuses = getAllAgentStatuses();
+      await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/agentStatuses`, statuses, apiKey);
+      const log = getRecentLog(30);
+      await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/activityLog`, log, apiKey);
+
+    } catch (err) {
+      console.error("Direct chat error:", err.message);
+    }
+
+    // Clear action
+    await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/agentDirectChat`, null, apiKey);
+  });
+
   // ── Heartbeat (original) ────────────────────────────────
   const heartbeat = setInterval(async () => {
     const dna = loadDNA();
+    const agentLog = getRecentLog(20);
+    await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/activityLog`, agentLog, apiKey);
     await rtdbPatch(rtdbUrl, `/workspaces/${workspaceId}`, {
       agentOnline:    true,
       agentLastSeen:  Date.now(),
       businessDNASet: dna.setupComplete,
       businessName:   dna.setupComplete ? dna.business?.name : null,
+      agentCount:     8,
     }, apiKey);
   }, 30000);
 
