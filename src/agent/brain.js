@@ -17,6 +17,7 @@ const { buildBusinessPrompt, loadDNA, isDNASetup, SETUP_QUESTIONS, processSetupA
 const { executeTeam, needsTeam } = require("./multiAgent");
 const { generateMorningBriefing, scanForOpportunities } = require("./proactiveAgent");
 const { getBestConnector, callConnector } = require("./connectors");
+const { executeTeamTask, chatWithAgent, addToLog } = require("./teamAgent");
 const {
   browserGoto, browserClick, browserType, browserFill,
   browserWait, browserExtract, browserExtractTable,
@@ -513,21 +514,28 @@ async function executeCommand(command, modelConfig) {
     };
   }
 
-  // ── 4. Multi-agent team for complex tasks ──────────────
-  if (needsTeam(command)) {
-    console.log("   → Assembling multi-agent team...");
-    const teamResult = await executeTeam(command, modelConfig, (progress) => {
-      console.log(`   Team: ${progress.message}`);
-    });
+  // ── 4. Smart team routing via Boss Agent ───────────────
+  const teamResult = await executeTeamTask(command, modelConfig, (progress) => {
+    console.log(`   Team: ${progress.message}`);
+  });
+
+  if (teamResult.solo) {
+    // Boss handled alone — continue to standard execution
     return {
-      success:    teamResult.success,
-      message:    `👥 **${teamResult.teamName}** completed!\n\n${teamResult.output || teamResult.message}`,
-      isTeamTask: true,
-      teamName:   teamResult.teamName,
-      agents:     teamResult.agents,
-      output:     teamResult.output,
+      success: teamResult.success,
+      message: teamResult.output || "Task completed.",
+      isTeamTask: false,
     };
   }
+
+  return {
+    success:    teamResult.success,
+    message:    `👥 Team completed!\n\n${teamResult.output || "Done."}`,
+    isTeamTask: true,
+    agents:     teamResult.agents,
+    output:     teamResult.output,
+    routing:    teamResult.routing,
+  };
 
   // ── 5. Standard single-agent execution (original flow) ─
   const taskType   = detectTaskType(command);
