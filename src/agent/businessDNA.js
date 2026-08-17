@@ -549,3 +549,251 @@ module.exports = {
   updateDNA,
   getDNASummary,
 };
+
+// ═══════════════════════════════════════════════════════════
+// DNA DRIFT DETECTION SYSTEM
+// Agent khud detect karta hai jab business reality
+// DNA se alag ho jaati hai
+// ═══════════════════════════════════════════════════════════
+
+// ── Drift patterns — kya detect karna hai ─────────────────
+const DRIFT_PATTERNS = [
+  // Revenue mentions
+  {
+    pattern: /(?:mrr|arr|revenue|making|earning|monthly revenue)[^\d]*\$?([\d,]+)k?/i,
+    dnaField: "metrics.mrr",
+    label: "Monthly Revenue",
+    extract: (match) => {
+      const num = match[1].replace(/,/g, "");
+      return match[0].toLowerCase().includes("k") ? `$${num}K/mo` : `$${num}/mo`;
+    },
+  },
+  // User/customer count
+  {
+    pattern: /(?:have|got|reached|now have|users|customers|subscribers)[^\d]*([\d,]+)\s*(?:users|customers|subscribers|signups)/i,
+    dnaField: "metrics.users",
+    label: "User Count",
+    extract: (match) => match[1].replace(/,/g, ""),
+  },
+  // Team size
+  {
+    pattern: /(?:team of|hired|we are now|team is now)[^\d]*([\d]+)\s*(?:people|members|employees|devs)/i,
+    dnaField: "team.size",
+    label: "Team Size",
+    extract: (match) => `Team of ${match[1]}`,
+  },
+  // Product name change
+  {
+    pattern: /(?:renamed|rebranded|now called|product is now|changed name to)\s+['""]?([A-Z][a-zA-Z\s]+)['""]?/i,
+    dnaField: "product.name",
+    label: "Product Name",
+    extract: (match) => match[1].trim(),
+  },
+  // Pricing change
+  {
+    pattern: /(?:changed pricing|new price|now costs|pricing is now)[^\d]*\$?([\d,]+)/i,
+    dnaField: "product.pricing",
+    label: "Pricing",
+    extract: (match) => `$${match[1]}`,
+  },
+  // Goal change
+  {
+    pattern: /(?:new goal|target|aiming for|want to reach|goal is now)[^\d]*\$?([\d,]+)k?\s*(?:mrr|arr|users|revenue)?/i,
+    dnaField: "metrics.goals",
+    label: "Business Goal",
+    extract: (match) => {
+      const num = match[1].replace(/,/g, "");
+      return match[0].toLowerCase().includes("k") ? `$${num}K` : `$${num}`;
+    },
+  },
+  // Focus change
+  {
+    pattern: /(?:focusing on|pivoting to|now focused on|priority is|main focus)[:\s]+([a-zA-Z\s,]+?)(?:\.|$)/i,
+    dnaField: "currentFocus",
+    label: "Current Focus",
+    extract: (match) => match[1].trim().slice(0, 60),
+  },
+  // Stage change
+  {
+    pattern: /(?:raised|closed|seed round|series [abc]|pre-seed)[^\d]*\$?([\d,.]+)(?:k|m|million|thousand)?/i,
+    dnaField: "business.stage",
+    label: "Funding Stage",
+    extract: (match) => {
+      const raw = match[0];
+      if (/series b/i.test(raw)) return "Series B";
+      if (/series a/i.test(raw)) return "Series A";
+      if (/seed/i.test(raw)) return "Seed funded";
+      return "Funded";
+    },
+  },
+];
+
+// ── Detect drift in a command ──────────────────────────────
+function detectDNADrift(command) {
+  const dna      = loadDNA();
+  if (!dna.setupComplete) return [];
+
+  const drifts   = [];
+
+  for (const dp of DRIFT_PATTERNS) {
+    const match = command.match(dp.pattern);
+    if (!match) continue;
+
+    const newValue = dp.extract(match);
+
+    // Get current DNA value
+    const parts = dp.dnaField.split(".");
+    let current = dna;
+    for (const p of parts) {
+      current = current?.[p];
+    }
+
+    const currentStr = Array.isArray(current)
+      ? current.map(g => g.description || g).join(", ")
+      : String(current || "");
+
+    // Only flag if different from DNA
+    if (currentStr && newValue && !currentStr.toLowerCase().includes(newValue.toLowerCase().slice(0, 10))) {
+      drifts.push({
+        field:      dp.dnaField,
+        label:      dp.label,
+        currentVal: currentStr,
+        newVal:     newValue,
+        confidence: "high",
+      });
+    }
+  }
+
+  return drifts;
+}
+
+// ── Build drift notification message ──────────────────────
+function buildDriftMessage(drifts) {
+  if (!drifts.length) return null;
+
+  const dna = loadDNA();
+  let msg   = `🧬 **DNA Update Detected**\n\n`;
+
+  drifts.forEach(d => {
+    msg += `Your **${d.label}** seems to have changed:\n`;
+    msg += `→ DNA says: \`${d.currentVal}\`\n`;
+    msg += `→ You mentioned: \`${d.newVal}\`\n\n`;
+  });
+
+  msg += `Should I update your Business DNA?\n`;
+  msg += `Reply **"yes update DNA"** and I'll save the changes.\n`;
+  msg += `Or **"no, keep old"** to ignore.`;
+
+  return msg;
+}
+
+// ── Apply drift updates ────────────────────────────────────
+function applyDriftUpdates(drifts) {
+  const dna = loadDNA();
+
+  drifts.forEach(d => {
+    const parts = d.field.split(".");
+    let obj     = dna;
+    for (let i = 0; i < parts.length - 1; i++) {
+      if (!obj[parts[i]]) obj[parts[i]] = {};
+      obj = obj[parts[i]];
+    }
+    const lastKey = parts[parts.length - 1];
+
+    // Special handling for arrays
+    if (lastKey === "goals") {
+      obj[lastKey] = [{ description: d.newVal, set: new Date().toISOString() }];
+    } else if (lastKey === "pricing") {
+      obj[lastKey] = [{ plan: "Updated", price: d.newVal }];
+    } else {
+      obj[lastKey] = d.newVal;
+    }
+  });
+
+  dna.lastUpdated = new Date().toISOString();
+  saveDNA(dna);
+  console.log(`🧬 DNA drift applied: ${drifts.length} fields updated`);
+  return dna;
+}
+
+// ── Weekly DNA health check ────────────────────────────────
+function generateDNAHealthReport() {
+  const dna = loadDNA();
+  if (!dna.setupComplete) return null;
+
+  const lastUpdated = new Date(dna.lastUpdated || dna.createdAt);
+  const daysSince   = Math.floor((Date.now() - lastUpdated.getTime()) / (1000 * 60 * 60 * 24));
+  const issues      = [];
+
+  // Check staleness
+  if (daysSince > 30) {
+    issues.push({
+      severity: "high",
+      field:    "overall",
+      message:  `Business DNA hasn't been updated in ${daysSince} days. Business reality may have drifted.`,
+      action:   'Type "update my business DNA" to refresh',
+    });
+  }
+
+  // Check empty critical fields
+  const criticalFields = [
+    { path: "metrics.mrr",         label: "Monthly Revenue" },
+    { path: "currentFocus",        label: "Current Focus" },
+    { path: "product.targetCustomer", label: "Target Customer" },
+    { path: "metrics.goals",       label: "Business Goals" },
+  ];
+
+  criticalFields.forEach(cf => {
+    const parts = cf.path.split(".");
+    let val     = dna;
+    for (const p of parts) val = val?.[p];
+    if (!val || (Array.isArray(val) && !val.length)) {
+      issues.push({
+        severity: "medium",
+        field:    cf.path,
+        message:  `${cf.label} is not set in your Business DNA`,
+        action:   `Tell me your ${cf.label.toLowerCase()} and I'll update it`,
+      });
+    }
+  });
+
+  return {
+    lastUpdated:  lastUpdated.toISOString(),
+    daysSince,
+    healthy:      issues.length === 0,
+    issues,
+    score:        Math.max(0, 100 - issues.length * 15),
+  };
+}
+
+// ── Detect "yes update DNA" intent ────────────────────────
+function isUpdateConfirmation(command) {
+  return /^(yes|yeah|yep|sure|ok|okay|update|confirm)\s*(update)?\s*(dna|it|them)?$/i.test(command.trim());
+}
+
+function isUpdateRejection(command) {
+  return /^(no|nope|nah|keep|ignore|skip|cancel)\s*(old|it|them)?$/i.test(command.trim());
+}
+
+module.exports = {
+  // original exports
+  initDNA,
+  loadDNA,
+  saveDNA,
+  isDNASetup,
+  SETUP_QUESTIONS,
+  processSetupAnswer,
+  completeSetup,
+  buildBusinessPrompt,
+  getAgentRoleDescription,
+  generateDailyBriefing,
+  updateDNA,
+  getDNASummary,
+  // new drift exports
+  detectDNADrift,
+  buildDriftMessage,
+  applyDriftUpdates,
+  generateDNAHealthReport,
+  isUpdateConfirmation,
+  isUpdateRejection,
+};
