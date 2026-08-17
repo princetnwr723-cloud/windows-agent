@@ -24,6 +24,7 @@ jobs:
           name: windows-build
           path: dist/*.exe
           if-no-files-found: warn
+          retention-days: 1
 
   build-mac-x64:
     runs-on: macos-latest
@@ -42,6 +43,7 @@ jobs:
           name: mac-x64-build
           path: dist/*-x64.dmg
           if-no-files-found: warn
+          retention-days: 1
 
   build-mac-arm64:
     runs-on: macos-latest
@@ -60,6 +62,7 @@ jobs:
           name: mac-arm64-build
           path: dist/*-arm64.dmg
           if-no-files-found: warn
+          retention-days: 1
 
   build-linux:
     runs-on: ubuntu-latest
@@ -88,3 +91,4 @@ jobs:
           name: linux-build
           path: dist/*.AppImage
           if-no-files-found: warn
+          retention-days: 1
