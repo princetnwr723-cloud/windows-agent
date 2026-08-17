@@ -13,7 +13,7 @@ const { runOllamaPrompt, runOllamaVision } = require("./ollamaManager");
 const { buildMemoryPrompt, extractLearnings, saveSession, initMemory } = require("./memory");
 const { shouldCreateSkill, generateSkill, getSkillForCommand, getSkillsSummary } = require("./skills");
 const { checkAndRequestPermission, assessCommandRisk } = require("./permissions");
-const { buildBusinessPrompt, loadDNA, isDNASetup, SETUP_QUESTIONS, processSetupAnswer, completeSetup } = require("./businessDNA");
+const { buildBusinessPrompt, loadDNA, isDNASetup, SETUP_QUESTIONS, processSetupAnswer, completeSetup, detectDNADrift, buildDriftMessage, applyDriftUpdates, isUpdateConfirmation, isUpdateRejection, generateDNAHealthReport } = require("./businessDNA");
 const { executeTeam, needsTeam } = require("./multiAgent");
 const { generateMorningBriefing, scanForOpportunities } = require("./proactiveAgent");
 const { getBestConnector, callConnector } = require("./connectors");
@@ -42,6 +42,20 @@ function setAgentContext(workspaceId, firebaseConfig, chatContext = {}) {
   _workspaceId    = workspaceId;
   _firebaseConfig = firebaseConfig;
   _chatContext    = chatContext;
+}
+
+// ── Drift state — pending updates ─────────────────────────
+const DRIFT_STATE_FILE = path.join(os.homedir(), ".vnus-agent", "drift-state.json");
+
+function loadDriftState() {
+  try { return JSON.parse(fs.readFileSync(DRIFT_STATE_FILE, "utf8")); }
+  catch { return { pending: null }; }
+}
+function saveDriftState(state) {
+  fs.writeFileSync(DRIFT_STATE_FILE, JSON.stringify(state, null, 2));
+}
+function clearDriftState() {
+  try { fs.unlinkSync(DRIFT_STATE_FILE); } catch {} 
 }
 
 // ── Setup state file ──────────────────────────────────────
@@ -495,6 +509,37 @@ async function executeCommand(command, modelConfig) {
     return { success:true, isSetupFlow:true, ...result };
   }
 
+  // ── 1.5 DNA Drift — Check pending update confirmation ───
+  const driftState = loadDriftState();
+  if (driftState.pending) {
+    if (isUpdateConfirmation(command)) {
+      applyDriftUpdates(driftState.pending);
+      clearDriftState();
+      return {
+        success: true,
+        message: "✅ Business DNA updated!\n\n" + driftState.pending.map(d => "→ " + d.label + ": " + d.newVal).join("\n") + "\n\nYour agent now has the latest context. 🧬",
+        isDriftUpdate: true,
+      };
+    }
+    if (isUpdateRejection(command)) {
+      clearDriftState();
+      return {
+        success: true,
+        message: "Got it — keeping your existing DNA unchanged. 🧬",
+        isDriftUpdate: true,
+      };
+    }
+  }
+
+  // ── 1.6 DNA Drift — Detect in current command ───────────
+  if (isDNASetup()) {
+    const drifts = detectDNADrift(command);
+    if (drifts.length > 0) {
+      saveDriftState({ pending: drifts });
+      console.log(`🧬 DNA drift detected: ${drifts.map(d => d.label).join(", ")}`);
+    }
+  }
+
   // ── 2. Morning briefing ────────────────────────────────
   if (isBriefingRequest(command)) {
     const briefing = await generateMorningBriefing(modelConfig);
@@ -595,7 +640,14 @@ Respond ONLY with a valid JSON array of actions. No explanation.`;
   const browserShot = results.find(r => r.action?.action==="browser_screenshot" && r.output)?.output;
   const finalShot   = modelConfig.visionEnabled ? await takeScreenshot() : null;
 
-  return { success, message, results, screenshot: browserShot || finalShot, taskType };
+  // Append drift notice if detected
+  const pendingDrift = loadDriftState();
+  let finalMessage = message;
+  if (pendingDrift.pending?.length) {
+    finalMessage = message + "\n\n---\n" + buildDriftMessage(pendingDrift.pending);
+  }
+
+  return { success, message: finalMessage, results, screenshot: browserShot || finalShot, taskType };
 }
 
 // ── Format briefing ───────────────────────────────────────
