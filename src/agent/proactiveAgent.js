@@ -4,7 +4,7 @@
 // ✅ Fixed: null safety on all DNA fields
 
 const { runOllamaPrompt }  = require("./ollamaManager");
-const { loadDNA, buildBusinessPrompt } = require("./businessDNA");
+const { loadDNA, buildBusinessPrompt, generateDNAHealthReport } = require("./businessDNA");
 const { buildMemoryPrompt } = require("./memory");
 const fs   = require("fs");
 const path = require("path");
@@ -193,6 +193,43 @@ Return ONLY valid JSON:
   }
 }
 
+// ── DNA Health Check — part of weekly report ─────────────
+async function checkDNAHealth(modelConfig) {
+  const health = generateDNAHealthReport();
+  if (!health) return null;
+
+  console.log(`🧬 DNA Health: ${health.score}/100 — ${health.issues.length} issues`);
+
+  if (health.issues.length === 0) {
+    return { healthy: true, score: 100, message: "Business DNA is up to date ✅" };
+  }
+
+  // Build notification
+  let msg = `🧬 **Business DNA Health Check**
+
+`;
+  msg += `Score: ${health.score}/100
+`;
+  msg += `Last updated: ${health.daysSince} days ago
+
+`;
+
+  if (health.issues.length > 0) {
+    msg += `**Issues found:**
+`;
+    health.issues.forEach(issue => {
+      const icon = issue.severity === "high" ? "🔴" : "🟡";
+      msg += `${icon} ${issue.message}
+`;
+      msg += `   → ${issue.action}
+
+`;
+    });
+  }
+
+  return { healthy: false, score: health.score, message: msg, issues: health.issues };
+}
+
 // ── Get latest briefing ───────────────────────────────────
 function getLatestBriefing() {
   try {
@@ -209,4 +246,5 @@ module.exports = {
   scanForOpportunities,
   generateWeeklyReport,
   getLatestBriefing,
+  checkDNAHealth,
 };
