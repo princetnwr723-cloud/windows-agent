@@ -2,8 +2,17 @@ name: Build & Release
 
 on:
   push:
-    branches: [main, master]
+    tags:
+      - "v*"
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Version (e.g. 1.0.1)"
+        required: true
+        default: "1.0.0"
+
+permissions:
+  contents: write
 
 jobs:
 
@@ -19,12 +28,16 @@ jobs:
       - run: npm run build:win
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
-      - uses: actions/upload-artifact@v4
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: windows-build
-          path: dist/*.exe
-          if-no-files-found: warn
-          retention-days: 1
+          tag_name: ${{ github.ref_name || format('v{0}', github.event.inputs.version) }}
+          name: "Agentic Vnus ${{ github.ref_name || format('v{0}', github.event.inputs.version) }}"
+          draft: false
+          prerelease: false
+          files: dist/*.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build-mac-x64:
     runs-on: macos-latest
@@ -38,12 +51,16 @@ jobs:
       - run: npm run build:mac
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
-      - uses: actions/upload-artifact@v4
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: mac-x64-build
-          path: dist/*-x64.dmg
-          if-no-files-found: warn
-          retention-days: 1
+          tag_name: ${{ github.ref_name || format('v{0}', github.event.inputs.version) }}
+          name: "Agentic Vnus ${{ github.ref_name || format('v{0}', github.event.inputs.version) }}"
+          draft: false
+          prerelease: false
+          files: dist/*-x64.dmg
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build-mac-arm64:
     runs-on: macos-latest
@@ -57,12 +74,16 @@ jobs:
       - run: npm run build:mac:arm
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
-      - uses: actions/upload-artifact@v4
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: mac-arm64-build
-          path: dist/*-arm64.dmg
-          if-no-files-found: warn
-          retention-days: 1
+          tag_name: ${{ github.ref_name || format('v{0}', github.event.inputs.version) }}
+          name: "Agentic Vnus ${{ github.ref_name || format('v{0}', github.event.inputs.version) }}"
+          draft: false
+          prerelease: false
+          files: dist/*-arm64.dmg
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build-linux:
     runs-on: ubuntu-latest
@@ -86,9 +107,13 @@ jobs:
       - run: npm run build:linux
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
-      - uses: actions/upload-artifact@v4
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: linux-build
-          path: dist/*.AppImage
-          if-no-files-found: warn
-          retention-days: 1
+          tag_name: ${{ github.ref_name || format('v{0}', github.event.inputs.version) }}
+          name: "Agentic Vnus ${{ github.ref_name || format('v{0}', github.event.inputs.version) }}"
+          draft: false
+          prerelease: false
+          files: dist/*.AppImage
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
