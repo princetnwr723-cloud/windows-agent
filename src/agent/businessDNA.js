@@ -535,20 +535,7 @@ function getDNASummary() {
   return `${dna.business.name} | ${dna.business.type} | ${dna.agentRole} mode | Focus: ${dna.currentFocus || "Growth"}`;
 }
 
-module.exports = {
-  initDNA,
-  loadDNA,
-  saveDNA,
-  isDNASetup,
-  SETUP_QUESTIONS,
-  processSetupAnswer,
-  completeSetup,
-  buildBusinessPrompt,
-  getAgentRoleDescription,
-  generateDailyBriefing,
-  updateDNA,
-  getDNASummary,
-};
+// exports combined at bottom
 
 // ═══════════════════════════════════════════════════════════
 // DNA DRIFT DETECTION SYSTEM
@@ -796,4 +783,7 @@ module.exports = {
   generateDNAHealthReport,
   isUpdateConfirmation,
   isUpdateRejection,
+  // new contextual opening
+  buildOpeningMessage,
+  detectIntendedRole,
 };
