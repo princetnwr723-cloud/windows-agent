@@ -8,12 +8,14 @@
 // ✅ Team progress sync to RTDB (new)
 // ✅ Proactive scheduler — briefing + opportunities (new)
 
-const { executeCommand, setAgentContext } = require("./brain");
+const { executeCommand, setAgentContext, takeScreenshot } = require("./brain");
 const { listSkills }                       = require("./skills");
 const { loadMemory }                       = require("./memory");
 const { isDNASetup, loadDNA }              = require("./businessDNA");
 const { generateMorningBriefing, monitorCompetitors, scanForOpportunities, generateWeeklyReport, checkDNAHealth } = require("./proactiveAgent");
 const { handleConnectorAction, syncConnectorsToRTDB } = require("./connectorHandler");
+const { initMCPManager, addMCPServer, removeMCPServer, startMCPServer, stopMCPServer, getMCPStatus, buildMCPPrompt, BUILTIN_MCPS } = require("./mcpManager");
+const { startTelegramBot, notify, loadTGConfig, saveBotToken, testBotToken, saveTGConfig } = require("./telegramBot");
 const { chatWithAgent, executeTeamTask, getAllAgentStatuses, getRecentLog, addToLog } = require("./teamAgent");
 const https                                = require("https");
 const http                                 = require("http");
@@ -295,6 +297,23 @@ function startCommandListener(workspaceId, firebaseConfig, modelConfig) {
   syncDNAToRTDB(rtdbUrl, workspaceId, apiKey);
   syncConnectorsToRTDB(workspaceId, (path, data) => rtdbSet(rtdbUrl, `/${path}`, data, apiKey));
 
+  // Init MCP Manager on startup
+  initMCPManager().then(async () => {
+    const status = getMCPStatus();
+    await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/mcpStatus`, status, apiKey);
+    console.log(`🔌 MCP status synced: ${status.totalRunning} running`);
+  }).catch(err => console.error("MCP init error:", err.message));
+
+  // Start Telegram bot
+  const tgBot = startTelegramBot(
+    executeCommand,
+    modelConfig,
+    (path, data) => rtdbSet(rtdbUrl, `/${path}`, data, apiKey),
+    workspaceId,
+    apiKey,
+    rtdbUrl
+  );
+
   // Sync agent statuses on startup
   try {
     const statuses = getAllAgentStatuses();
@@ -416,7 +435,7 @@ function startCommandListener(workspaceId, firebaseConfig, modelConfig) {
   listenRTDB(rtdbUrl, `/workspaces/${workspaceId}/screenshotRequest`, apiKey, async (event, payload) => {
     if (!payload?.data?.requested) return;
     console.log("📸 Screenshot requested");
-    const { takeScreenshot } = require("./brain");
+    // takeScreenshot imported at top
     const shot = await takeScreenshot();
     if (shot) {
       await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/liveView`, { screenshot:shot, takenAt:Date.now() }, apiKey);
@@ -435,6 +454,78 @@ function startCommandListener(workspaceId, firebaseConfig, modelConfig) {
     );
     // Clear action after handling
     await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/connectorAction`, null, apiKey);
+  });
+
+  // ── Telegram Config ──────────────────────────────────────
+  listenRTDB(rtdbUrl, `/workspaces/${workspaceId}/telegramConfig`, apiKey, async (event, payload) => {
+    if (!payload?.data) return;
+    const { action, token, sentAt } = payload.data;
+    if (Date.now() - (sentAt || 0) > 30000) return;
+
+
+    if (action === "test") {
+      const result = await testBotToken(token);
+      await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/telegramTestResult`, {
+        ...result, timestamp: Date.now(),
+      }, apiKey);
+    } else if (action === "save") {
+      saveBotToken(token);
+      await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/telegramStatus`, {
+        enabled: true, savedAt: Date.now(),
+      }, apiKey);
+    } else if (action === "disable") {
+      const cfg = loadTGConfig();
+      cfg.enabled = false;
+      saveTGConfig(cfg);
+      await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/telegramStatus`, {
+        enabled: false,
+      }, apiKey);
+    }
+    await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/telegramConfig`, null, apiKey);
+  });
+
+  // ── MCP Actions ──────────────────────────────────────────
+  listenRTDB(rtdbUrl, `/workspaces/${workspaceId}/mcpAction`, apiKey, async (event, payload) => {
+    if (!payload?.data) return;
+    const { action, serverId, server, config, sentAt } = payload.data;
+    if (Date.now() - (sentAt || 0) > 30000) return;
+
+    console.log(`\n🔌 MCP action: ${action} → ${serverId || config?.id}`);
+
+    try {
+      let result = { success: false, message: "Unknown action" };
+
+      if (action === "install") {
+        // Install builtin MCP
+        const builtin = BUILTIN_MCPS.find(b => b.id === serverId);
+        if (builtin) {
+          const res = await addMCPServer({ ...builtin, type: "npm", source: builtin.package });
+          result = { success: res.success, message: res.success ? `${builtin.name} installed and running` : res.error };
+        }
+      } else if (action === "remove") {
+        removeMCPServer(serverId);
+        result = { success: true, message: "MCP server removed" };
+      } else if (action === "add_custom") {
+        const res = await addMCPServer(config);
+        result = { success: res.success, message: res.success ? `${config.name} installed successfully` : res.error };
+      }
+
+      // Sync updated status
+      const status = getMCPStatus();
+      await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/mcpStatus`, status, apiKey);
+      await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/mcpActionResult`, {
+        ...result, timestamp: Date.now(),
+      }, apiKey);
+
+    } catch (err) {
+      console.error("MCP action error:", err.message);
+      await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/mcpActionResult`, {
+        success: false, message: err.message, timestamp: Date.now(),
+      }, apiKey);
+    }
+
+    // Clear action
+    await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/mcpAction`, null, apiKey);
   });
 
   // ── Direct Agent Chat ────────────────────────────────────
@@ -484,6 +575,11 @@ function startCommandListener(workspaceId, firebaseConfig, modelConfig) {
   // ── Heartbeat (original) ────────────────────────────────
   const heartbeat = setInterval(async () => {
     const dna = loadDNA();
+    // Sync MCP status in heartbeat
+    try {
+      const mcpStatus = getMCPStatus();
+      await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/mcpStatus`, mcpStatus, apiKey);
+    } catch {}
     const agentLog = getRecentLog(20);
     await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/activityLog`, agentLog, apiKey);
     await rtdbPatch(rtdbUrl, `/workspaces/${workspaceId}`, {
