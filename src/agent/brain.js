@@ -13,11 +13,12 @@ const { runOllamaPrompt, runOllamaVision } = require("./ollamaManager");
 const { buildMemoryPrompt, extractLearnings, saveSession, initMemory } = require("./memory");
 const { shouldCreateSkill, generateSkill, getSkillForCommand, getSkillsSummary } = require("./skills");
 const { checkAndRequestPermission, assessCommandRisk } = require("./permissions");
-const { buildBusinessPrompt, loadDNA, isDNASetup, SETUP_QUESTIONS, processSetupAnswer, completeSetup, detectDNADrift, buildDriftMessage, applyDriftUpdates, isUpdateConfirmation, isUpdateRejection, generateDNAHealthReport } = require("./businessDNA");
+const { buildBusinessPrompt, loadDNA, isDNASetup, SETUP_QUESTIONS, processSetupAnswer, completeSetup, detectDNADrift, buildDriftMessage, applyDriftUpdates, isUpdateConfirmation, isUpdateRejection, generateDNAHealthReport, buildOpeningMessage, detectIntendedRole } = require("./businessDNA");
 const { executeTeam, needsTeam } = require("./multiAgent");
 const { generateMorningBriefing, scanForOpportunities } = require("./proactiveAgent");
 const { getBestConnector, callConnector } = require("./connectors");
 const { executeTeamTask, chatWithAgent, addToLog } = require("./teamAgent");
+const { buildMCPPrompt, callMCPTool, getAllMCPTools } = require("./mcpManager");
 const {
   browserGoto, browserClick, browserType, browserFill,
   browserWait, browserExtract, browserExtractTable,
@@ -78,7 +79,40 @@ function clearSetupState() {
 
 // ── Detect special command types ──────────────────────────
 function isBusinessSetupRequest(cmd) {
-  return /introduce.*business|setup.*business|business.*dna|meet.*business|tell.*about.*business|my.*business.*is|configure.*agent.*role/i.test(cmd);
+  const patterns = [
+    // Direct DNA setup
+    /introduce.*business/i,
+    /setup.*business/i,
+    /business.*dna/i,
+    /meet.*business/i,
+    /tell.*about.*business/i,
+    /configure.*agent.*role/i,
+
+    // Role assignment — "make you CEO/CMO/CTO..."
+    /make you (my )?(ceo|cmo|cto|cfo|sales|chief|head|lead|director|manager|partner|employee|assistant)/i,
+    /want you (to be|as) (my )?(ceo|cmo|cto|cfo|agent|assistant|partner|employee)/i,
+    /you (are|will be|become) (now )?(my )?(ceo|cmo|cto|cfo|agent|employee|partner)/i,
+
+    // Business ownership framing
+    /run my (business|company|startup|agency|store|saas)/i,
+    /manage my (business|company|startup|agency)/i,
+    /be my (ceo|cmo|cto|cfo|partner|cofounder|employee|business partner|chief)/i,
+    /act as my (ceo|cmo|cto|cfo|partner|employee|executive|advisor)/i,
+    /work (for|with) my (business|company|startup)/i,
+    /join my (team|company|business|startup)/i,
+    /you('re| are) hired/i,
+    /i('m| am) hiring you/i,
+    /become my ai (ceo|cmo|cto|employee|partner|cofounder)/i,
+
+    // Business introduction variants
+    /let me tell you about my business/i,
+    /my business is called/i,
+    /i (run|own|have|started|built|founded) a (business|company|startup|agency|store|saas|app)/i,
+    /i('m| am) (a founder|an entrepreneur|building|running)/i,
+    /here('s| is) my business/i,
+    /about my (business|company|startup|product)/i,
+  ];
+  return patterns.some(p => p.test(cmd));
 }
 
 function isBriefingRequest(cmd) {
@@ -460,6 +494,9 @@ async function executeActions(actions) {
       else if (name==="github_search")         output = await githubSearch(action.query,action.owner,action.repo);
       else if (name==="github_clone")          output = await githubCloneLocally(action.owner,action.repo,action.target);
       else if (name==="github_commit_multiple") output = await githubCommitMultiple(action.owner,action.repo,action.files,action.message,action.branch);
+      else if (name === "mcp_call") {
+        output = await callMCPTool(action.server, action.tool, action.params || {});
+      }
       else console.warn(`⚠️ Unknown action: ${name}`);
       results.push({success:true,action,output});
       const noDelay = ["write_file","read_file","github_read_file","github_write_file","wait"];
@@ -476,9 +513,9 @@ async function executeActions(actions) {
 async function handleBusinessSetup(command, setupState) {
   const questions = SETUP_QUESTIONS;
   if (!setupState.inProgress) {
-    saveSetupState({ inProgress:true, currentQuestion:0, answers:{} });
-    const q = questions[0];
-    return { setupInProgress:true, message:`🧬 Let's set up your Business DNA!\n\nThis takes about 5 minutes. I'll remember everything forever.\n\n**Question 1/${questions.length}:**\n${q.question}\n\n💡 ${q.example}`, options:q.options||null };
+    saveSetupState({ inProgress:true, currentQuestion:0, answers:{}, originalCommand:command });
+    const openingMsg = buildOpeningMessage(command, questions.length);
+    return { setupInProgress:true, message:`🧬 ${openingMsg}`, options:questions[0].options||null };
   }
   const q          = questions[setupState.currentQuestion];
   let dna          = loadDNA();
