@@ -15,6 +15,8 @@ const { isDNASetup, loadDNA }              = require("./businessDNA");
 const { generateMorningBriefing, monitorCompetitors, scanForOpportunities, generateWeeklyReport, checkDNAHealth } = require("./proactiveAgent");
 const { handleConnectorAction, syncConnectorsToRTDB } = require("./connectorHandler");
 const { initMCPManager, addMCPServer, removeMCPServer, startMCPServer, stopMCPServer, getMCPStatus, buildMCPPrompt, BUILTIN_MCPS } = require("./mcpManager");
+const { listMacros, deleteMacro } = require("./demonstrationRecorder");
+const { listTasks, getTasksNeedingApproval, resumeTask, deleteTask } = require("./sessionPersistence");
 const { startTelegramBot, notify, loadTGConfig, saveBotToken, testBotToken, saveTGConfig } = require("./telegramBot");
 const { chatWithAgent, executeTeamTask, getAllAgentStatuses, getRecentLog, addToLog } = require("./teamAgent");
 const https                                = require("https");
@@ -22,6 +24,9 @@ const http                                 = require("http");
 
 const MAX_PER_MIN = 20;
 const rateLimiter = new Map();
+
+// ── Rate-limit tracker for approval notifications ──────────
+const lastApprovalNotify = {};
 
 function isRateLimited(userId) {
   if (!userId) return false;
@@ -484,6 +489,34 @@ function startCommandListener(workspaceId, firebaseConfig, modelConfig) {
     await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/telegramConfig`, null, apiKey);
   });
 
+  // ── Automation Tasks & Macros ─────────────────────────────
+  listenRTDB(rtdbUrl, `/workspaces/${workspaceId}/automationAction`, apiKey, async (event, payload) => {
+    if (!payload?.data) return;
+    const { action, taskId, macroName, sentAt } = payload.data;
+    if (Date.now() - (sentAt || 0) > 30000) return;
+
+    console.log(`\n🤖 Automation action: ${action} → ${taskId || macroName}`);
+
+    try {
+      if (action === "resume_task") {
+        resumeTask(taskId);
+      } else if (action === "delete_task") {
+        deleteTask(taskId);
+      } else if (action === "delete_macro") {
+        deleteMacro(macroName);
+      }
+
+      // Sync updated lists back
+      await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/automationTasks`, listTasks(), apiKey);
+      await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/automationMacros`, listMacros(), apiKey);
+      await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/pendingApprovals`, getTasksNeedingApproval(), apiKey);
+    } catch (err) {
+      console.error("Automation action error:", err.message);
+    }
+
+    await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/automationAction`, null, apiKey);
+  });
+
   // ── MCP Actions ──────────────────────────────────────────
   listenRTDB(rtdbUrl, `/workspaces/${workspaceId}/mcpAction`, apiKey, async (event, payload) => {
     if (!payload?.data) return;
@@ -579,6 +612,26 @@ function startCommandListener(workspaceId, firebaseConfig, modelConfig) {
     try {
       const mcpStatus = getMCPStatus();
       await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/mcpStatus`, mcpStatus, apiKey);
+    } catch {}
+
+    // Sync automation tasks + macros, notify Telegram if approval needed
+    // (rate-limited to once per 15 min per task so it doesn't spam every 30s)
+    try {
+      const tasks    = listTasks();
+      const macros   = listMacros();
+      const pending  = getTasksNeedingApproval();
+      await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/automationTasks`, tasks, apiKey);
+      await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/automationMacros`, macros, apiKey);
+      await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/pendingApprovals`, pending, apiKey);
+
+      if (pending.length > 0) {
+        const now = Date.now();
+        const freshlyPending = pending.filter(t => now - (lastApprovalNotify[t.id] || 0) > 15 * 60 * 1000);
+        if (freshlyPending.length > 0) {
+          await notify(`⏸️ ${freshlyPending.length} task(s) waiting on your approval: ${freshlyPending.map(t => t.label).join(", ")}`);
+          freshlyPending.forEach(t => { lastApprovalNotify[t.id] = now; });
+        }
+      }
     } catch {}
     const agentLog = getRecentLog(20);
     await rtdbSet(rtdbUrl, `/workspaces/${workspaceId}/activityLog`, agentLog, apiKey);
