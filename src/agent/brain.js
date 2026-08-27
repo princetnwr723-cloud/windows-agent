@@ -19,11 +19,15 @@ const { generateMorningBriefing, scanForOpportunities } = require("./proactiveAg
 const { getBestConnector, callConnector } = require("./connectors");
 const { executeTeamTask, chatWithAgent, addToLog } = require("./teamAgent");
 const { buildMCPPrompt, callMCPTool, getAllMCPTools } = require("./mcpManager");
+const { runAutomationTask } = require("./accessibilityEngine");
+const { startRecording, stopRecording, replayMacro, listMacros, isRecording } = require("./demonstrationRecorder");
+const { createTask, saveProgress, pauseTask, resumeTask, completeTask, getTask, listTasks, getTasksNeedingApproval } = require("./sessionPersistence");
 const {
   browserGoto, browserClick, browserType, browserFill,
   browserWait, browserExtract, browserExtractTable,
   browserScreenshot, browserKey, browserSelect, browserScroll,
   browserHover, browserExists, browserNewTab, browserEval, browserSmartLogin,
+  getPage,
 } = require("./browserAgent");
 const {
   githubAuth, githubListRepos, githubListFiles, githubReadFile,
@@ -175,6 +179,7 @@ function buildSystemPrompt(taskType = "general") {
   const skillsContext   = getSkillsSummary();
   const cotSteps        = getCoTInstruction(taskType);
   const businessContext = buildBusinessPrompt(); // empty string if DNA not set
+  const mcpContext      = buildMCPPrompt();       // empty string if no MCP servers running
 
   return `You are Agentic Vnus, a self-improving AI agent running on the user's PC.
 CRITICAL: Respond ONLY with a valid JSON array. No markdown, no explanation, no text outside the array.
@@ -182,6 +187,7 @@ CRITICAL: Respond ONLY with a valid JSON array. No markdown, no explanation, no 
 ${businessContext}
 ${memoryContext}
 ${skillsContext}
+${mcpContext}
 
 ${cotSteps}
 
@@ -211,6 +217,25 @@ BROWSER (preferred for web tasks):
 {"action":"browser_scroll","direction":"down","amount":500}
 {"action":"browser_eval","script":"return document.title"}
 
+RELIABLE BROWSER AUTOMATION (use for multi-step tasks on unfamiliar sites —
+reads the real accessibility tree instead of guessing coordinates, verifies
+each step actually worked, and retries automatically):
+{"action":"smart_browser_task","label":"Post a job listing","taskId":"optional-id","steps":[
+  {"description":"Post a job button","action":"click","expectedChange":"navigate to new form page"},
+  {"description":"Job title","action":"type","value":"Senior Engineer"},
+  {"description":"Submit","action":"click","expectedChange":"show confirmation"}
+]}
+
+LEARN-BY-DEMONSTRATION (for tools with no API — user performs the task once,
+agent records it, then replays it with new data every future run):
+{"action":"start_recording","taskName":"Create Creatify video"}
+{"action":"stop_recording"}
+{"action":"replay_macro","macroName":"Create Creatify video","data":{"video title":"Summer Sale Promo"}}
+
+LONG-RUNNING TASK CONTROL (a task paused earlier — e.g. waiting on your
+approval, a 2FA code, or a CAPTCHA — resumes from its exact last step):
+{"action":"resume_paused_task","taskId":"task_12345"}
+
 GITHUB:
 {"action":"github_auth","token":"ghp_..."}
 {"action":"github_list_repos"}
@@ -218,6 +243,9 @@ GITHUB:
 {"action":"github_write_file","owner":"user","repo":"repo","path":"file.js","content":"...","message":"commit"}
 {"action":"github_create_repo","name":"my-repo","description":"...","private":false}
 {"action":"github_create_pr","owner":"user","repo":"repo","title":"PR title","body":"description","head":"feature","base":"main"}
+
+MCP TOOLS (any connected server — filesystem, web search, Slack, custom):
+{"action":"mcp_call","server":"server-id","tool":"tool-name","params":{}}
 
 FLOW:
 {"action":"done","message":"What was accomplished"}
@@ -496,6 +524,41 @@ async function executeActions(actions) {
       else if (name==="github_commit_multiple") output = await githubCommitMultiple(action.owner,action.repo,action.files,action.message,action.branch);
       else if (name === "mcp_call") {
         output = await callMCPTool(action.server, action.tool, action.params || {});
+      }
+      else if (name === "smart_browser_task") {
+        // Reliable multi-step browser task using accessibility tree +
+        // perceive-think-act-verify loop instead of screenshot guessing.
+        // getPage() auto-launches the browser if it isn't running yet.
+        const page = await getPage();
+        const taskId = action.taskId || `task_${Date.now()}`;
+        createTask(taskId, { label: action.label || "Browser automation", totalSteps: (action.steps||[]).length });
+        const result = await runAutomationTask(page, action.steps || [], {
+          onLog: (msg) => console.log(msg),
+        });
+        saveProgress(taskId, result.completedSteps, { lastResult: result });
+        if (result.success) completeTask(taskId, true, result);
+        else pauseTask(taskId, `Stuck at step ${result.completedSteps + 1}: ${result.results?.[result.completedSteps]?.error || "unknown error"}`);
+        output = JSON.stringify({ taskId, ...result });
+      }
+      else if (name === "start_recording") {
+        const page = await getPage();
+        const rec = await startRecording(page, action.taskName || "Recorded task");
+        output = rec.message || JSON.stringify(rec);
+      }
+      else if (name === "stop_recording") {
+        const rec = await stopRecording();
+        output = rec.message || JSON.stringify(rec);
+      }
+      else if (name === "replay_macro") {
+        const page = await getPage();
+        const result = await replayMacro(page, action.macroName, action.data || {}, {
+          onLog: (msg) => console.log(msg),
+        });
+        output = JSON.stringify(result);
+      }
+      else if (name === "resume_paused_task") {
+        const t = resumeTask(action.taskId);
+        output = t ? `Resumed task: ${t.label} (step ${t.currentStep})` : "Task not found";
       }
       else console.warn(`⚠️ Unknown action: ${name}`);
       results.push({success:true,action,output});
