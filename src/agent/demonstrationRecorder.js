@@ -10,10 +10,12 @@
 const fs   = require("fs");
 const path = require("path");
 const os   = require("os");
-const { perceive, actOnElement, verify } = require("./accessibilityEngine");
+const { perceive, actOnElement, verify, perceiveThinkActVerify } = require("./accessibilityEngine");
 
-const MACRO_DIR = path.join(os.homedir(), ".vnus-agent", "macros");
-if (!fs.existsSync(MACRO_DIR)) fs.mkdirSync(MACRO_DIR, { recursive: true });
+const MACRO_DIR   = path.join(os.homedir(), ".vnus-agent", "macros");
+const EXAMPLE_DIR = path.join(os.homedir(), ".vnus-agent", "macro-examples");
+if (!fs.existsSync(MACRO_DIR))   fs.mkdirSync(MACRO_DIR, { recursive: true });
+if (!fs.existsSync(EXAMPLE_DIR)) fs.mkdirSync(EXAMPLE_DIR, { recursive: true });
 
 let activeRecording = null; // { name, startedAt, rawEvents: [] }
 
@@ -104,13 +106,41 @@ async function stopRecording() {
     return { success: false, error: "No actions were captured during recording" };
   }
 
-  const macro = generalizeMacro(rawEvents, { name, startUrl, startedAt });
+  // Save this raw example — future recordings of the SAME task name
+  // get diffed against past examples to detect true parameters with
+  // evidence, instead of guessing from a single run
+  saveRawExample(name, rawEvents, startUrl);
+
+  const priorExamples = loadRawExamples(name);
+  const macro = priorExamples.length > 1
+    ? generalizeFromMultipleExamples(priorExamples, { name, startedAt })
+    : generalizeMacro(rawEvents, { name, startUrl, startedAt });
+
   saveMacro(name, macro);
 
-  console.log(`⏹️ Recording stopped: "${name}" — ${macro.steps.length} steps captured`);
+  const learningNote = priorExamples.length > 1
+    ? ` (learned from ${priorExamples.length} examples — parameters detected by comparison, not guessed)`
+    : ` (single example — record it again with different data any time to sharpen parameter detection)`;
+
+  console.log(`⏹️ Recording stopped: "${name}" — ${macro.steps.length} steps captured${learningNote}`);
   activeRecording = null;
 
-  return { success: true, macro, message: `Saved "${name}" with ${macro.steps.length} steps.` };
+  return { success: true, macro, exampleCount: priorExamples.length, message: `Saved "${name}" with ${macro.steps.length} steps.${learningNote}` };
+}
+
+// ── Save/load raw examples for multi-recording comparison ───
+function saveRawExample(name, rawEvents, startUrl) {
+  const file = path.join(EXAMPLE_DIR, `${slugify(name)}.json`);
+  const existing = loadRawExamples(name);
+  existing.push({ rawEvents, startUrl, recordedAt: new Date().toISOString() });
+  // Keep at most the last 5 examples — enough signal, doesn't grow forever
+  fs.writeFileSync(file, JSON.stringify(existing.slice(-5), null, 2));
+}
+
+function loadRawExamples(name) {
+  const file = path.join(EXAMPLE_DIR, `${slugify(name)}.json`);
+  try { return JSON.parse(fs.readFileSync(file, "utf8")); }
+  catch { return []; }
 }
 
 // ── Generalize raw events into a replayable macro ──────────
@@ -165,15 +195,59 @@ function generalizeMacro(rawEvents, meta) {
   };
 }
 
-// ── Heuristic: is this typed value likely "data" (should be
-// swappable on replay) vs fixed boilerplate text? ──────────
+// ── Heuristic fallback: used only on the FIRST recording, before
+// any multi-example evidence exists. Once 2+ examples are recorded,
+// generalizeFromMultipleExamples() replaces this with real evidence.
 function guessIsParameter(value) {
   if (!value || value.length < 2) return false;
-  // Looks like a proper noun, title, or short phrase → likely a parameter
-  const looksLikeTitle = /^[A-Z]/.test(value) && value.split(" ").length <= 8;
+  const looksLikeTitle  = /^[A-Z]/.test(value) && value.split(" ").length <= 8;
   const looksLikeUrl    = /^https?:\/\//.test(value);
   const looksLikeNumber = /^\d+$/.test(value);
   return looksLikeTitle || looksLikeUrl || looksLikeNumber;
+}
+
+// ── Generalize from MULTIPLE examples — evidence, not guessing ──
+// This is the key upgrade: if the user records the same task 2-3
+// times with different data, we compare the recordings directly.
+// A field that held DIFFERENT values across examples is unambiguously
+// a parameter. A field with the SAME value every time is boilerplate.
+// This beats single-example heuristics because it's based on real
+// evidence rather than "does this look like a title?" guesswork.
+function generalizeFromMultipleExamples(examples, meta) {
+  // Build one generalized step-sequence per example first
+  const runs = examples.map(ex => generalizeMacro(ex.rawEvents, {
+    name: meta.name, startUrl: ex.startUrl, startedAt: ex.recordedAt,
+  }));
+
+  // Use the example with the most steps as the reference skeleton —
+  // shorter runs are usually just faster/simpler paths through the same UI
+  const reference = runs.reduce((a, b) => (b.steps.length > a.steps.length ? b : a));
+
+  const steps = reference.steps.map((refStep, i) => {
+    if (refStep.action !== "type") return refStep; // only typed fields can be parameters
+
+    // Collect the value typed into the "same" field across every run
+    // (matched by description + action, tolerant of small index drift)
+    const valuesAcrossRuns = runs
+      .map(run => run.steps.find(s => s.action === "type" && s.description === refStep.description))
+      .filter(Boolean)
+      .map(s => s.value);
+
+    const uniqueValues = new Set(valuesAcrossRuns);
+    const isParameter = uniqueValues.size > 1; // different every time = real parameter
+
+    return { ...refStep, isParameter, evidenceCount: valuesAcrossRuns.length, sampleValues: [...uniqueValues].slice(0, 3) };
+  });
+
+  return {
+    name: meta.name,
+    createdAt: meta.startedAt,
+    startUrl: reference.startUrl,
+    steps,
+    runCount: 0,
+    lastRun: null,
+    learnedFrom: examples.length,
+  };
 }
 
 // ── Save / load macros to disk ──────────────────────────────
@@ -217,18 +291,25 @@ function slugify(name) {
 // ── Replay a saved macro, optionally substituting new data ──
 // newData: { "video title": "Winter Sale", "description": "..." }
 // matched loosely against the step's `description` label.
+// Self-healing: if a recorded step's exact element has moved or
+// changed (site got a minor update), falls back to the full
+// perceive-think-act-verify loop using the step's description as
+// the goal — so a stale macro degrades gracefully instead of
+// hard-failing on the first UI tweak.
 async function replayMacro(page, name, newData = {}, options = {}) {
   const macro = loadMacro(name);
   if (!macro) return { success: false, error: `No macro found named "${name}"` };
 
-  const { onLog = console.log } = options;
-  onLog(`▶️ Replaying "${name}" — ${macro.steps.length} steps`);
+  const { onLog = console.log, selfHeal = true } = options;
+  onLog(`▶️ Replaying "${name}" — ${macro.steps.length} steps${macro.learnedFrom > 1 ? ` (learned from ${macro.learnedFrom} examples)` : ""}`);
 
   if (macro.startUrl) {
     await page.goto(macro.startUrl, { waitUntil: "domcontentloaded" }).catch(() => {});
   }
 
   const results = [];
+  let healedSteps = 0;
+
   for (let i = 0; i < macro.steps.length; i++) {
     const step = macro.steps[i];
     onLog(`  [${i + 1}/${macro.steps.length}] ${step.action} → "${step.description}"`);
@@ -239,7 +320,6 @@ async function replayMacro(page, name, newData = {}, options = {}) {
       continue;
     }
 
-    // Substitute parameter value if a matching override was provided
     let value = step.value;
     if (step.isParameter) {
       const override = findDataOverride(step.description, newData);
@@ -247,12 +327,25 @@ async function replayMacro(page, name, newData = {}, options = {}) {
     }
 
     const element = { role: step.role, name: step.description };
-    const actResult = await actOnElement(page, element, step.action, value);
+    let actResult = await actOnElement(page, element, step.action, value);
 
-    results.push({ step: i + 1, success: actResult.success, error: actResult.error });
+    // Self-heal: recorded locator didn't work — reason about it fresh
+    if (!actResult.success && selfHeal) {
+      onLog(`  ⚠️ Recorded step didn't match — falling back to live reasoning`);
+      const healed = await perceiveThinkActVerify(page, {
+        description: step.description, action: step.action, value,
+      }, { ...options, onLog, maxRetries: 2 });
+      if (healed.success) {
+        healedSteps++;
+        actResult = { success: true };
+        onLog(`  ✅ Self-healed step ${i + 1}`);
+      }
+    }
+
+    results.push({ step: i + 1, success: actResult.success, error: actResult.error, healed: !actResult.success ? false : (healedSteps > 0) });
 
     if (!actResult.success) {
-      onLog(`  ⚠️ Step ${i + 1} failed: ${actResult.error} — attempting to continue`);
+      onLog(`  ⚠️ Step ${i + 1} failed even after self-heal attempt — continuing`);
     }
     await page.waitForTimeout(400);
   }
@@ -262,9 +355,9 @@ async function replayMacro(page, name, newData = {}, options = {}) {
   saveMacro(name, macro);
 
   const failedSteps = results.filter(r => !r.success).length;
-  onLog(`${failedSteps === 0 ? "✅" : "⚠️"} Replay complete — ${results.length - failedSteps}/${results.length} steps succeeded`);
+  onLog(`${failedSteps === 0 ? "✅" : "⚠️"} Replay complete — ${results.length - failedSteps}/${results.length} steps succeeded${healedSteps ? ` (${healedSteps} self-healed)` : ""}`);
 
-  return { success: failedSteps === 0, results, macro: { name: macro.name, runCount: macro.runCount } };
+  return { success: failedSteps === 0, results, healedSteps, macro: { name: macro.name, runCount: macro.runCount } };
 }
 
 function findDataOverride(fieldLabel, newData) {
@@ -279,6 +372,8 @@ module.exports = {
   startRecording,
   stopRecording,
   generalizeMacro,
+  generalizeFromMultipleExamples,
+  loadRawExamples,
   saveMacro,
   loadMacro,
   listMacros,
