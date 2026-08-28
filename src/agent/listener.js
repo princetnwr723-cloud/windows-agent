@@ -17,6 +17,7 @@ const { handleConnectorAction, syncConnectorsToRTDB } = require("./connectorHand
 const { initMCPManager, addMCPServer, removeMCPServer, startMCPServer, stopMCPServer, getMCPStatus, buildMCPPrompt, BUILTIN_MCPS } = require("./mcpManager");
 const { listMacros, deleteMacro } = require("./demonstrationRecorder");
 const { listTasks, getTasksNeedingApproval, resumeTask, deleteTask } = require("./sessionPersistence");
+const { startAutoSync } = require("./powerManager");
 const { startTelegramBot, notify, loadTGConfig, saveBotToken, testBotToken, saveTGConfig } = require("./telegramBot");
 const { chatWithAgent, executeTeamTask, getAllAgentStatuses, getRecentLog, addToLog } = require("./teamAgent");
 const https                                = require("https");
@@ -260,7 +261,7 @@ function scheduleWeekly(day, timeStr, fn) {
 }
 
 // ── Main listener (original structure + new features) ─────
-function startCommandListener(workspaceId, firebaseConfig, modelConfig) {
+async function startCommandListener(workspaceId, firebaseConfig, modelConfig) {
   const { rtdbUrl, apiKey } = firebaseConfig;
 
   if (!rtdbUrl) {
@@ -301,6 +302,10 @@ function startCommandListener(workspaceId, firebaseConfig, modelConfig) {
   syncMemoryToRTDB(rtdbUrl, workspaceId, apiKey);
   syncDNAToRTDB(rtdbUrl, workspaceId, apiKey);
   syncConnectorsToRTDB(workspaceId, (path, data) => rtdbSet(rtdbUrl, `/${path}`, data, apiKey));
+
+  // Start power manager — keeps PC awake only while a task is
+  // actively running or waiting on approval, releases it otherwise
+  startAutoSync();
 
   // Init MCP Manager on startup
   initMCPManager().then(async () => {
