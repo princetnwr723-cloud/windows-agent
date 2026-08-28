@@ -219,15 +219,22 @@ BROWSER (preferred for web tasks):
 
 RELIABLE BROWSER AUTOMATION (use for multi-step tasks on unfamiliar sites —
 reads the real accessibility tree instead of guessing coordinates, verifies
-each step actually worked, and retries automatically):
-{"action":"smart_browser_task","label":"Post a job listing","taskId":"optional-id","steps":[
+each step actually worked, and retries automatically. Ambiguous matches
+pause for approval; clear matches run straight through — set confidenceThreshold
+lower (e.g. 0.3) for a trusted routine task, higher (e.g. 0.7) for something
+sensitive like a payment flow):
+{"action":"smart_browser_task","label":"Post a job listing","taskId":"optional-id","confidenceThreshold":0.5,"steps":[
   {"description":"Post a job button","action":"click","expectedChange":"navigate to new form page"},
   {"description":"Job title","action":"type","value":"Senior Engineer"},
-  {"description":"Submit","action":"click","expectedChange":"show confirmation"}
+  {"description":"Submit","action":"click","expectedChange":"show confirmation","hint":"in the modal"}
 ]}
 
 LEARN-BY-DEMONSTRATION (for tools with no API — user performs the task once,
-agent records it, then replays it with new data every future run):
+agent records it, then replays it with new data every future run. If the
+SAME taskName is recorded 2-3 times with different data, the agent compares
+the recordings directly to detect which fields are real parameters — this
+is far more reliable than guessing from one run, so suggest recording a
+task twice when the user has time):
 {"action":"start_recording","taskName":"Create Creatify video"}
 {"action":"stop_recording"}
 {"action":"replay_macro","macroName":"Create Creatify video","data":{"video title":"Summer Sale Promo"}}
@@ -529,15 +536,27 @@ async function executeActions(actions) {
         // Reliable multi-step browser task using accessibility tree +
         // perceive-think-act-verify loop instead of screenshot guessing.
         // getPage() auto-launches the browser if it isn't running yet.
+        // Smart Approval: only genuinely ambiguous steps pause for a
+        // human decision — clear matches run straight through instead
+        // of stopping at every "risky-sounding" step.
         const page = await getPage();
         const taskId = action.taskId || `task_${Date.now()}`;
         createTask(taskId, { label: action.label || "Browser automation", totalSteps: (action.steps||[]).length });
         const result = await runAutomationTask(page, action.steps || [], {
           onLog: (msg) => console.log(msg),
+          confidenceThreshold: action.confidenceThreshold ?? 0.5,
+          onNeedsApproval: async (info) => {
+            pauseTask(taskId, `Needs confirmation: "${info.description}" matched with ${(info.score * 100).toFixed(0)}% confidence, ${info.alternatives} other possible match(es)`);
+            // Approval arrives asynchronously via the dashboard/Telegram
+            // "resume_task" action, which flips status back to "running".
+            // We surface the pause immediately rather than blocking here —
+            // the task resumes as a fresh run when the user approves.
+            return false;
+          },
         });
         saveProgress(taskId, result.completedSteps, { lastResult: result });
         if (result.success) completeTask(taskId, true, result);
-        else pauseTask(taskId, `Stuck at step ${result.completedSteps + 1}: ${result.results?.[result.completedSteps]?.error || "unknown error"}`);
+        else if (!result.needsApproval) pauseTask(taskId, `Stuck at step ${result.completedSteps + 1}: ${result.results?.[result.completedSteps]?.error || "unknown error"}`);
         output = JSON.stringify({ taskId, ...result });
       }
       else if (name === "start_recording") {
