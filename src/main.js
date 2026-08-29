@@ -1,8 +1,9 @@
-// src/main.js — Complete with RTDB + Scheduler
+// src/main.js — Complete with RTDB + Auto-updater + Scheduler
 const {
   app, BrowserWindow, Tray, Menu, nativeImage,
   shell, dialog, ipcMain, screen,
 } = require("electron");
+const { autoUpdater } = require("electron-updater");
 const path            = require("path");
 const os              = require("os");
 const fs              = require("fs");
@@ -112,6 +113,60 @@ async function listenForPlanVerification(userId, onVerified) {
   });
 }
 
+// ── Auto Updater ──────────────────────────────────────────
+function setupAutoUpdater() {
+  autoUpdater.autoDownload    = true;
+  autoUpdater.autoInstallOnAppQuit = true;
+
+  autoUpdater.on("checking-for-update", () => {
+    console.log("🔍 Checking for updates...");
+  });
+
+  autoUpdater.on("update-available", (info) => {
+    console.log(`📦 Update available: v${info.version}`);
+    tray?.setToolTip(`Agentic Vnus — Downloading update v${info.version}...`);
+    sendToSplash("update-status", { status: "downloading", version: info.version });
+  });
+
+  autoUpdater.on("update-not-available", () => {
+    console.log("✅ App is up to date");
+  });
+
+  autoUpdater.on("download-progress", (progress) => {
+    const pct = Math.round(progress.percent);
+    console.log(`📥 Update download: ${pct}%`);
+    tray?.setToolTip(`Agentic Vnus — Update ${pct}%`);
+  });
+
+  autoUpdater.on("update-downloaded", (info) => {
+    console.log(`✅ Update downloaded: v${info.version}`);
+    tray?.setToolTip("Agentic Vnus — Update ready");
+
+    dialog.showMessageBox({
+      type:      "info",
+      title:     "Update Ready — Agentic Vnus",
+      message:   `v${info.version} is ready to install`,
+      detail:    "The update has been downloaded. Restart now to apply it — takes less than 30 seconds.",
+      buttons:   ["Restart & Install", "Later"],
+      defaultId: 0,
+      icon:      path.join(__dirname, "../assets/icon.png"),
+    }).then(result => {
+      if (result.response === 0) {
+        isQuitting = true;
+        autoUpdater.quitAndInstall();
+      }
+    });
+  });
+
+  autoUpdater.on("error", (err) => {
+    console.error("❌ Auto-update error:", err.message);
+  });
+
+  // Check on startup, then every 4 hours
+  setTimeout(() => autoUpdater.checkForUpdates(), 10000);
+  setInterval(() => autoUpdater.checkForUpdates(), 4 * 60 * 60 * 1000);
+}
+
 // ── Splash helpers ────────────────────────────────────────
 function sendToSplash(event, data) {
   if (splashWindow && !splashWindow.isDestroyed()) {
@@ -182,6 +237,8 @@ function createTray() {
       { label: "Open Workspace", enabled: connected && st.modelReady, click: () => createWorkspaceWindow(st.agentCode) },
       { label: "Open Website",   click: () => shell.openExternal(WEBSITE) },
       { type: "separator" },
+      { label: "Check for Updates", click: () => autoUpdater.checkForUpdates() },
+      { type: "separator" },
       { label: "Quit", click: () => { isQuitting = true; app.quit(); } },
     ]));
   };
@@ -235,7 +292,8 @@ ipcMain.on("model-selected", async (event, { modelOption, visionEnabled, visionM
       sendToSplash("model-ready");
       const st = loadState();
       if (st.userId) {
-        startFullAgent(st.agentCode, st.selectedModel);
+        startFullAgent(st.agentCode, st.selectedModel)
+          .catch(err => console.error("❌ startFullAgent error:", err.message));
         setTimeout(() => createWorkspaceWindow(st.agentCode), 1500);
       }
     }, 800);
@@ -251,7 +309,12 @@ ipcMain.on("retry-model-download", () => {
 });
 
 // ── Start full agent (listener + scheduler) ───────────────
-function startFullAgent(code, selectedModel) {
+// NOTE: startCommandListener is now async (it awaits MCP init,
+// agent status sync, etc. on startup) — this function must be
+// async too, and must AWAIT it, or listenerCleanup ends up holding
+// a Promise instead of the actual cleanup function, which crashes
+// the next time it's called as listenerCleanup().
+async function startFullAgent(code, selectedModel) {
   if (!selectedModel) return;
   const modelConfig = {
     ollamaId:       selectedModel.ollamaId,
@@ -261,7 +324,7 @@ function startFullAgent(code, selectedModel) {
 
   // Start RTDB command listener
   if (listenerCleanup) listenerCleanup();
-  listenerCleanup = startCommandListener(code, firebaseConfig, modelConfig);
+  listenerCleanup = await startCommandListener(code, firebaseConfig, modelConfig);
 
   // Start scheduler
   startScheduler(code, firebaseConfig, modelConfig);
@@ -289,6 +352,9 @@ app.whenReady().then(async () => {
   let   state    = loadState();
   const updateMenu = createTray();
   const specs    = getPCSpecs();
+
+  // Setup auto updater
+  setupAutoUpdater();
 
   if (!state.isSetup) {
     const r = await dialog.showMessageBox({
@@ -327,7 +393,7 @@ app.whenReady().then(async () => {
     if (st.userId && st.planVerified && st.modelReady && st.selectedModel && !st.userDisconnected) {
       updateMenu(true);
       sendToSplash("agent-data", { code: st.agentCode, pcName: os.hostname(), os: getOSName(), connected: true, plan: st.plan });
-      startFullAgent(st.agentCode, st.selectedModel);
+      await startFullAgent(st.agentCode, st.selectedModel);
       setTimeout(() => createWorkspaceWindow(st.agentCode), 800);
       return;
     }
