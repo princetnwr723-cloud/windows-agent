@@ -22,6 +22,12 @@ const { buildMCPPrompt, callMCPTool, getAllMCPTools } = require("./mcpManager");
 const { runAutomationTask } = require("./accessibilityEngine");
 const { startRecording, stopRecording, replayMacro, listMacros, isRecording } = require("./demonstrationRecorder");
 const { createTask, saveProgress, pauseTask, resumeTask, completeTask, getTask, listTasks, getTasksNeedingApproval } = require("./sessionPersistence");
+const { buildCapabilityPrompt, getAgentMCPs } = require("./capabilityDirectory");
+const { checkAgainstConstitution, buildConstitutionPrompt, addRule } = require("./agentConstitution");
+const { classifyImpact, buildPreview, shouldSimulate, resolveSimulation } = require("./simulationEngine");
+const { routeToolRequest, getToolAvailability } = require("./toolRouter");
+const { recordSnapshot, buildTrajectoryReport, answerTrajectoryQuestion } = require("./worldModel");
+const { recordCorrection } = require("./personalizationLoop");
 const {
   browserGoto, browserClick, browserType, browserFill,
   browserWait, browserExtract, browserExtractTable,
@@ -51,6 +57,18 @@ function setAgentContext(workspaceId, firebaseConfig, chatContext = {}) {
 
 // ── Drift state — pending updates ─────────────────────────
 const DRIFT_STATE_FILE = path.join(os.homedir(), ".vnus-agent", "drift-state.json");
+const SIM_STATE_FILE   = path.join(os.homedir(), ".vnus-agent", "pending-simulation.json");
+
+function loadPendingSimulation() {
+  try { return JSON.parse(fs.readFileSync(SIM_STATE_FILE, "utf8")); }
+  catch { return null; }
+}
+function savePendingSimulation(data) {
+  fs.writeFileSync(SIM_STATE_FILE, JSON.stringify(data, null, 2));
+}
+function clearPendingSimulation() {
+  try { fs.unlinkSync(SIM_STATE_FILE); } catch {}
+}
 
 function loadDriftState() {
   try { return JSON.parse(fs.readFileSync(DRIFT_STATE_FILE, "utf8")); }
@@ -175,18 +193,22 @@ TASK STEPS:
 
 // ── System prompt (original + business DNA) ───────────────
 function buildSystemPrompt(taskType = "general") {
-  const memoryContext   = buildMemoryPrompt();
-  const skillsContext   = getSkillsSummary();
-  const cotSteps        = getCoTInstruction(taskType);
-  const businessContext = buildBusinessPrompt(); // empty string if DNA not set
-  const mcpContext      = buildMCPPrompt();       // empty string if no MCP servers running
+  const memoryContext      = buildMemoryPrompt();
+  const skillsContext      = getSkillsSummary();
+  const cotSteps           = getCoTInstruction(taskType);
+  const businessContext    = buildBusinessPrompt(); // empty string if DNA not set
+  const mcpContext         = buildMCPPrompt();       // empty string if no MCP servers running
+  const constitutionContext = buildConstitutionPrompt(); // empty if no rules set
+  const capabilityContext   = buildCapabilityPrompt();   // empty if no agents/MCPs configured
 
   return `You are Agentic Vnus, a self-improving AI agent running on the user's PC.
 CRITICAL: Respond ONLY with a valid JSON array. No markdown, no explanation, no text outside the array.
 
+${constitutionContext}
 ${businessContext}
 ${memoryContext}
 ${skillsContext}
+${capabilityContext}
 ${mcpContext}
 
 ${cotSteps}
@@ -250,6 +272,13 @@ GITHUB:
 {"action":"github_write_file","owner":"user","repo":"repo","path":"file.js","content":"...","message":"commit"}
 {"action":"github_create_repo","name":"my-repo","description":"...","private":false}
 {"action":"github_create_pr","owner":"user","repo":"repo","title":"PR title","body":"description","head":"feature","base":"main"}
+
+UNIVERSAL TOOL USE (use when the user names a specific tool by name —
+routes through MCP first if connected, then a learned macro if one
+exists, then figures it out live via the accessibility engine as a
+last resort — always prefer this over guessing raw browser actions
+when a named tool is involved):
+{"action":"use_tool","tool":"Canva","goal":"create a YouTube thumbnail","data":{"title":"Summer Sale"}}
 
 MCP TOOLS (any connected server — filesystem, web search, Slack, custom):
 {"action":"mcp_call","server":"server-id","tool":"tool-name","params":{}}
@@ -426,6 +455,28 @@ function parseActions(text) {
 }
 
 // ── AI call with CoT + retry (original) ───────────────────
+// ── Plan-only mode — used by Simulation Gate to preview actions
+// WITHOUT executing them. Reuses the same planning path (connector
+// if available, else local Ollama) but stops right after parsing. ──
+async function planActionsOnly(command, modelConfig) {
+  try {
+    const taskType     = detectTaskType(command);
+    const systemPrompt = buildSystemPrompt(taskType);
+    const username      = os.userInfo().username;
+    const userContent = `Task: "${command}"\n\nSystem: ${os.platform()==="win32"?"Windows":os.platform()==="darwin"?"macOS":"Linux"}\nUsername: ${username}\nDesktop: ${path.join(os.homedir(),"Desktop")}\nHome: ${os.homedir()}\nTask type: ${taskType}\n\nOutput ONLY a valid JSON array. Do not execute anything — this is a plan-only preview.`;
+
+    const connector = await getBestConnector(taskType);
+    const text = connector
+      ? await callConnector(connector, systemPrompt, userContent)
+      : await runOllamaPrompt(modelConfig.ollamaId, systemPrompt, userContent);
+
+    return parseActions(text);
+  } catch (err) {
+    console.error("Plan-only preview failed:", err.message);
+    return null;
+  }
+}
+
 async function callLocalAI(command, screenshotBase64, modelConfig, taskType, retryCount = 0) {
   const { ollamaId, visionOllamaId, visionEnabled } = modelConfig;
   const username  = os.userInfo().username;
@@ -579,6 +630,17 @@ async function executeActions(actions) {
         const t = resumeTask(action.taskId);
         output = t ? `Resumed task: ${t.label} (step ${t.currentStep})` : "Task not found";
       }
+      else if (name === "use_tool") {
+        // Universal Tool Router — MCP → learned macro → live reasoning,
+        // in that priority order, for tools with or without an MCP
+        const result = await routeToolRequest(action.tool, action.goal, {
+          data: action.data || {},
+          knownUrl: action.url || null,
+          steps: action.steps || [],
+          onLog: (msg) => console.log(msg),
+        });
+        output = JSON.stringify(result);
+      }
       else console.warn(`⚠️ Unknown action: ${name}`);
       results.push({success:true,action,output});
       const noDelay = ["write_file","read_file","github_read_file","github_write_file","wait"];
@@ -657,6 +719,60 @@ async function executeCommand(command, modelConfig) {
       saveDriftState({ pending: drifts });
       console.log(`🧬 DNA drift detected: ${drifts.map(d => d.label).join(", ")}`);
     }
+  }
+
+  // ── 1.7 Constitution — add a new permanent rule ──────────
+  if (/^constitution:\s*/i.test(command)) {
+    const rule = addRule(command.replace(/^constitution:\s*/i, "").trim());
+    return { success: true, message: `📜 Constitution rule added [${rule.type}]. This applies to every future command — no exceptions, no talking it back.` };
+  }
+
+  // ── 1.8 Constitution — hard-block check before anything runs ──
+  const constitutionCheck = checkAgainstConstitution(command);
+  if (!constitutionCheck.allowed) {
+    const violation = constitutionCheck.blockedBy;
+    return {
+      success: false,
+      message: `🚫 Blocked by your Constitution: ${violation.reason}\n\nThis rule was set permanently and can't be overridden mid-conversation. Update it from the dashboard's Constitution tab if it needs to change.`,
+      constitutionBlock: true,
+    };
+  }
+
+  // ── 1.9 Simulation approval / cancellation (check FIRST —
+  // before treating "yes run it" itself as a new command to simulate) ──
+  const pendingSim = loadPendingSimulation();
+  if (pendingSim && /^(yes run it|run it|confirm|approve|go ahead)$/i.test(command.trim())) {
+    clearPendingSimulation();
+    resolveSimulation(pendingSim.id, true);
+    const result = await executeActions(pendingSim.actions);
+    return { success: result.success, message: `✅ Executed as previewed.\n\n${result.message}` };
+  }
+  if (pendingSim && /^(cancel|no|stop|abort)$/i.test(command.trim())) {
+    clearPendingSimulation();
+    resolveSimulation(pendingSim.id, false);
+    return { success: true, message: "Cancelled — nothing was run." };
+  }
+
+  // ── 1.10 Simulation gate — high-impact actions preview first ──
+  if (shouldSimulate(command)) {
+    const plannedActions = await planActionsOnly(command, modelConfig).catch(() => null);
+    if (plannedActions?.length) {
+      const preview = buildPreview(command, plannedActions);
+      savePendingSimulation({ id: preview.id, actions: plannedActions });
+      return {
+        success: true,
+        isSimulation: true,
+        message: `👁️ **Preview before running** (${preview.impact} impact — ${preview.category})\n\n` +
+          preview.steps.map(s => `${s.step}. ${s.description}${s.reversible ? "" : " ⚠️ not reversible"}`).join("\n") +
+          `\n\n${preview.irreversibleCount > 0 ? `${preview.irreversibleCount} step(s) can't be undone. ` : ""}Reply "yes run it" to execute, or "cancel" to stop here.`,
+        simulationId: preview.id,
+      };
+    }
+  }
+
+  // ── 1.11 World Model — trajectory questions ──────────────
+  if (/where.*heading|trajectory|trend|projection|forecast/i.test(command) && isDNASetup()) {
+    return { success: true, message: buildTrajectoryReport() };
   }
 
   // ── 2. Morning briefing ────────────────────────────────
