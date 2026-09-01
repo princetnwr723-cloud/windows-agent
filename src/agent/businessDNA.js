@@ -260,6 +260,42 @@ const SETUP_QUESTIONS = [
   },
 ];
 
+// ── Detect what role user wants ──────────────────────────
+function detectIntendedRole(command) {
+  if (/ceo|chief executive|founder|strategy|grow/i.test(command)) return "CEO";
+  if (/cmo|marketing|content|brand|social/i.test(command))        return "CMO";
+  if (/cto|tech|code|developer|engineer|architect/i.test(command)) return "CTO";
+  if (/cfo|finance|revenue|money|accounting/i.test(command))      return "CFO";
+  if (/sales|outreach|lead|prospect|close/i.test(command))        return "SALES";
+  return null;
+}
+
+// ── Build a contextual opening message ────────────────────
+function buildOpeningMessage(command, questionCount) {
+  const q = SETUP_QUESTIONS[0];
+  let greeting = "";
+
+  if (/ceo/i.test(command)) {
+    greeting = `I'd be honored to be your AI CEO. 👑\n\nTo serve your business well, I need to understand it first. Let's take 5 minutes to set up your Business DNA — I'll ask ${questionCount} questions and remember everything forever.\n\n`;
+  } else if (/cmo/i.test(command)) {
+    greeting = `Your AI CMO, ready to grow your brand. 📢\n\nFirst, let me understand your business. ${questionCount} quick questions — then I'll handle all your marketing with full context.\n\n`;
+  } else if (/cto/i.test(command)) {
+    greeting = `AI CTO, reporting for duty. 💻\n\nTo make the right technical decisions for your company, I need context. ${questionCount} questions — then I'm fully yours.\n\n`;
+  } else if (/cfo/i.test(command)) {
+    greeting = `Your AI CFO is here. 💰\n\nTo optimize your finances, I need to know your business. ${questionCount} quick questions — then I'll track every number.\n\n`;
+  } else if (/partner|cofounder/i.test(command)) {
+    greeting = `Business partner activated. 🤝\n\nEvery good partnership starts with understanding. Let me ask you ${questionCount} questions about your business — then we build together.\n\n`;
+  } else if (/employee|hired|hiring/i.test(command)) {
+    greeting = `Hired. Starting now. 👹\n\nBefore I get to work, I need to understand your business completely. ${questionCount} questions — takes 5 minutes — remembered forever.\n\n`;
+  } else if (/run|manage/i.test(command)) {
+    greeting = `Ready to run your business. Let me understand it first.\n\n${questionCount} questions — 5 minutes — then I work for you 24/7.\n\n`;
+  } else {
+    greeting = `Let's set up your Business DNA.\n\nI'll ask ${questionCount} questions about your business — takes 5 minutes — and remember everything forever. Every command after this will use this context automatically.\n\n`;
+  }
+
+  return `${greeting}**Question 1/${questionCount}:**\n${q.question}\n\n💡 ${q.example}`;
+}
+
 // ── Process a setup answer ─────────────────────────────────
 function processSetupAnswer(questionId, answer, dna) {
   const q = SETUP_QUESTIONS.find(q => q.id === questionId);
