@@ -1,9 +1,13 @@
-// src/main.js — Complete with RTDB + Auto-updater + Scheduler
+// src/main.js — Complete with RTDB + Scheduler
 const {
   app, BrowserWindow, Tray, Menu, nativeImage,
   shell, dialog, ipcMain, screen,
 } = require("electron");
-const { autoUpdater } = require("electron-updater");
+// Auto-updater disabled — electron-updater wasn't bundled into the
+// packaged app (missing from the build), which crashed the app on
+// launch with "Cannot find module 'electron-updater'". Re-enable
+// once it's confirmed present in package.json dependencies AND
+// electron-builder's output — see setupAutoUpdater() below.
 const path            = require("path");
 const os              = require("os");
 const fs              = require("fs");
@@ -113,8 +117,25 @@ async function listenForPlanVerification(userId, onVerified) {
   });
 }
 
-// ── Auto Updater ──────────────────────────────────────────
+// ── Auto Updater — DISABLED ─────────────────────────────────
+// Was crashing the packaged app because electron-updater wasn't
+// actually bundled in. Kept as a no-op stub (not deleted outright)
+// so any existing call to setupAutoUpdater() elsewhere in this
+// file still runs safely instead of throwing.
+//
+// To re-enable later:
+//   1. Confirm "electron-updater" is in package.json "dependencies"
+//      (not devDependencies)
+//   2. Rebuild and verify resources/app.asar actually contains
+//      node_modules/electron-updater after packaging
+//   3. Restore the code below (kept commented, unchanged)
 function setupAutoUpdater() {
+  console.log("ℹ️ Auto-updater disabled for this build — checking manually via GitHub Releases instead");
+  return;
+
+  /* ORIGINAL IMPLEMENTATION — restore once electron-updater is
+     confirmed bundled correctly in the packaged app:
+
   autoUpdater.autoDownload    = true;
   autoUpdater.autoInstallOnAppQuit = true;
 
@@ -165,6 +186,7 @@ function setupAutoUpdater() {
   // Check on startup, then every 4 hours
   setTimeout(() => autoUpdater.checkForUpdates(), 10000);
   setInterval(() => autoUpdater.checkForUpdates(), 4 * 60 * 60 * 1000);
+  */
 }
 
 // ── Splash helpers ────────────────────────────────────────
@@ -237,7 +259,9 @@ function createTray() {
       { label: "Open Workspace", enabled: connected && st.modelReady, click: () => createWorkspaceWindow(st.agentCode) },
       { label: "Open Website",   click: () => shell.openExternal(WEBSITE) },
       { type: "separator" },
-      { label: "Check for Updates", click: () => autoUpdater.checkForUpdates() },
+      { label: "Check for Updates", click: () => {
+        shell.openExternal("https://github.com/princetnwr723-cloud/windows-agent/releases/latest");
+      }},
       { type: "separator" },
       { label: "Quit", click: () => { isQuitting = true; app.quit(); } },
     ]));
