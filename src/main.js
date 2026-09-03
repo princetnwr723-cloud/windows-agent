@@ -76,18 +76,27 @@ function getOSName() {
 const { rtdbSet, rtdbGet, rtdbPatch, rtdbDelete } = require("./agent/listener");
 
 async function rtdbRegisterAgent(code, pcInfo) {
-  await rtdbSet(RTDB_URL, `/workspaces/${code}`, {
-    code, userId: null, userDisconnected: false,
-    status: "waiting", agentOnline: true,
-    pcName: pcInfo.pcName, os: pcInfo.os,
-    platform: pcInfo.platform, username: pcInfo.username,
-    totalMemory: pcInfo.totalMemory,
-    registeredAt: Date.now(),
-  }, firebaseConfig.apiKey);
+  console.log(`📡 Registering agent at /workspaces/${code} on ${RTDB_URL}`);
+  try {
+    const result = await rtdbSet(RTDB_URL, `/workspaces/${code}`, {
+      code, userId: null, userDisconnected: false,
+      status: "waiting", agentOnline: true,
+      pcName: pcInfo.pcName, os: pcInfo.os,
+      platform: pcInfo.platform, username: pcInfo.username,
+      totalMemory: pcInfo.totalMemory,
+      registeredAt: Date.now(),
+    }, firebaseConfig.apiKey);
+    console.log(`✅ Agent registered:`, result ? "success" : "NULL RESPONSE — check RTDB rules / RTDB_URL");
+    return result;
+  } catch (err) {
+    console.error(`❌ Agent registration FAILED — check that RTDB rules are published and RTDB_URL is correct:`, err.message);
+    throw err;
+  }
 }
 
 async function listenForConnection(code, onConnected, onDisconnected) {
   const { listenRTDB } = require("./agent/listener");
+  console.log(`👂 Listening for connection at /workspaces/${code}`);
   listenRTDB(RTDB_URL, `/workspaces/${code}`, firebaseConfig.apiKey, (event, payload) => {
     const data = payload?.data;
     if (!data) return;
@@ -99,19 +108,32 @@ async function listenForConnection(code, onConnected, onDisconnected) {
     if (userDisconnected && status === "disconnected") {
       onDisconnected?.();
     } else if (status === "connected" && userId && !userDisconnected) {
+      console.log(`✅ Connection detected — userId: ${userId}`);
       onConnected(userId, plan);
     }
   });
 }
 
-async function listenForPlanVerification(userId, onVerified) {
+// ── FIX: previously listened on /users/{userId}, which requires
+// Firebase Auth (auth != null && auth.uid == $userId in RTDB rules).
+// The Electron agent has NO Firebase Auth session — it only makes
+// raw REST calls with the public web API key, never a real ID
+// token — so that read ALWAYS failed silently (PERMISSION_DENIED),
+// and the model picker screen never appeared after choosing a plan.
+//
+// Now listens on /workspaces/{code} instead, which is fully open
+// in RTDB rules (".read": true, ".write": true) and is where
+// PlanWall.tsx + the Gumroad webhook now mirror the plan to.
+async function listenForPlanVerification(code, onVerified) {
   const { listenRTDB } = require("./agent/listener");
-  listenRTDB(RTDB_URL, `/users/${userId}`, firebaseConfig.apiKey, (event, payload) => {
+  console.log(`👂 Listening for plan at /workspaces/${code}`);
+  listenRTDB(RTDB_URL, `/workspaces/${code}`, firebaseConfig.apiKey, (event, payload) => {
     const data = payload?.data;
     if (!data) return;
     const plan         = data.plan;
     const planVerified = data.planVerified;
     if (plan && (planVerified === true || plan === "free")) {
+      console.log(`✅ Plan detected: ${plan}`);
       onVerified(plan);
     }
   });
@@ -372,6 +394,14 @@ app.whenReady().then(async () => {
 
   initMemory();
 
+  // ── Sanity check: fail loud instead of silent if RTDB_URL is missing ──
+  if (!RTDB_URL) {
+    console.error("❌ FATAL: firebaseConfig.rtdbUrl is empty — agent cannot register or listen for anything. Check src/config.js / FIREBASE_RTDB_URL env var.");
+    dialog.showErrorBox("Configuration Error", "Realtime Database URL is not configured. The agent cannot connect. Please reinstall or contact support.");
+  } else {
+    console.log(`🔗 RTDB URL: ${RTDB_URL}`);
+  }
+
   const code     = generatePermanentCode();
   let   state    = loadState();
   const updateMenu = createTray();
@@ -390,18 +420,36 @@ app.whenReady().then(async () => {
     if (r.response !== 0) { app.quit(); return; }
 
     const pcInfo = getPCInfo();
-    await rtdbRegisterAgent(code, pcInfo);
+    try {
+      await rtdbRegisterAgent(code, pcInfo);
+    } catch (err) {
+      dialog.showErrorBox(
+        "Could not register agent",
+        `Failed to write to the database. Check your internet connection and that Realtime Database rules are published.\n\n${err.message}`
+      );
+    }
     state = saveState({ isSetup: true, agentCode: code, userId: null, plan: null, planVerified: false, selectedModel: null, modelReady: false, userDisconnected: false });
   } else {
     state.agentCode = code;
-    const wsData = await rtdbGet(RTDB_URL, `/workspaces/${code}`, firebaseConfig.apiKey);
+    let wsData = null;
+    try {
+      wsData = await rtdbGet(RTDB_URL, `/workspaces/${code}`, firebaseConfig.apiKey);
+    } catch (err) {
+      console.error("❌ Could not read existing workspace state:", err.message);
+    }
     if (wsData?.userDisconnected) {
       state = saveState({ userId: null, userDisconnected: true, plan: null, planVerified: false, modelReady: false, selectedModel: null });
       await rtdbPatch(RTDB_URL, `/workspaces/${code}`, { status: "waiting", userId: null, userDisconnected: false }, firebaseConfig.apiKey);
     }
     if (!wsData) {
+      // Workspace node doesn't exist (e.g. DB was reset, or first
+      // registration silently failed before this fix) — re-register.
       const pcInfo = getPCInfo();
-      await rtdbRegisterAgent(code, pcInfo);
+      try {
+        await rtdbRegisterAgent(code, pcInfo);
+      } catch (err) {
+        dialog.showErrorBox("Could not re-register agent", err.message);
+      }
     }
     saveState({ agentCode: code });
     state = loadState();
@@ -438,9 +486,28 @@ app.whenReady().then(async () => {
         saveState({ userId, userDisconnected: false });
         updateMenu(true);
         sendToSplash("workspace-connected", { userId });
+
+        // ── FIX: if the plan was already written by the time we
+        // get the connection event (race condition — e.g. free plan
+        // chosen very fast, or webhook already fired), skip straight
+        // to the model picker instead of showing "waiting for plan"
+        // forever.
+        if (planFromRTDB) {
+          saveState({ plan: planFromRTDB, planVerified: true });
+          sendToSplash("plan-verified", { plan: planFromRTDB });
+          sendToSplash("show-model-picker", { specs, modelOptions: getModelOptions(planFromRTDB, specs), plan: planFromRTDB });
+          return;
+        }
+
         sendToSplash("waiting-for-plan", { message: "Waiting for plan selection..." });
 
-        listenForPlanVerification(userId, async (plan) => {
+        // ── FIX: was listenForPlanVerification(userId, ...) reading
+        // the auth-protected /users/{userId} node — the agent has no
+        // Firebase Auth session so that always failed silently.
+        // Now listens on /workspaces/{code} (open in RTDB rules),
+        // which PlanWall.tsx and the Gumroad webhook mirror the plan
+        // into.
+        listenForPlanVerification(code, async (plan) => {
           saveState({ plan, planVerified: true });
           sendToSplash("plan-verified", { plan });
           sendToSplash("show-model-picker", { specs, modelOptions: getModelOptions(plan, specs), plan });
