@@ -399,6 +399,18 @@ function showScreen(id) {
 // ── IPC Events ───────────────────────────────────────────
 
 // Code + initial state
+// FIX: previously this called showScreen("s-setup") whenever
+// data.connected && data.plan were both truthy — with a comment
+// admitting "will be overridden below", but nothing after this
+// handler actually overrode it in every code path (main.js's
+// "fully ready" branch only sends agent-data + starts the agent,
+// no further screen-changing event follows immediately). That
+// caused a flash back to the "enter your code" screen even when
+// the agent was already fully connected and about to open the
+// workspace window. This handler should ONLY update code/PC info
+// text — screen selection belongs entirely to the more specific
+// events below (show-model-picker, model-ready, workspace-connected,
+// waiting-for-plan), which always fire correctly for every state.
 window.vnusAgent.onAgentData((data) => {
   agentCode = data.code || "";
   document.getElementById("code-p1").textContent = agentCode.slice(0, 5);
@@ -407,15 +419,16 @@ window.vnusAgent.onAgentData((data) => {
     document.getElementById("setup-sub").textContent =
       `Running on ${data.pcName}. Enter the code in your dashboard to connect.`;
   }
-  if (data.connected && data.plan) {
-    // Already connected — seedha model picker ya workspace
-    showScreen("s-setup"); // will be overridden below
-  }
+  // No showScreen() call here anymore — the specific event that
+  // follows (show-model-picker / model-ready / workspace-connected)
+  // is always responsible for picking the right screen. If NONE of
+  // those fire (e.g. genuinely still waiting for a connection),
+  // "s-setup" is already the default active screen from page load,
+  // so nothing needs to happen here either way.
 });
 
 // User ne website pe code daala — connected!
 window.vnusAgent.onWorkspaceConnected((data) => {
-  // Plan wait screen dikho
   showScreen("s-plan-wait");
 });
 
@@ -424,11 +437,10 @@ window.vnusAgent.onWaitingForPlan?.((data) => {
   showScreen("s-plan-wait");
 });
 
-// Plan verified — model picker dikho
-window.vnusAgent.onPlanVerified?.((data) => {
-  // Model picker screen pe jaao
-  // show-model-picker event aayega main.js se
-});
+// Plan verified — model picker dikhega via show-model-picker event
+// (kept for completeness / future use, doesn't need to change screen
+// itself since show-model-picker always follows immediately after)
+window.vnusAgent.onPlanVerified?.((data) => {});
 
 // Model picker
 window.vnusAgent.onShowModelPicker((data) => {
@@ -471,6 +483,11 @@ function renderModelPicker(data) {
 
   const list = document.getElementById("models-list");
   list.innerHTML = "";
+
+  if (!modelOptions?.models?.length) {
+    list.innerHTML = `<p style="color:#666;font-size:11px;text-align:center;padding:20px 0">No compatible models found for your specs. Please contact support.</p>`;
+    return;
+  }
 
   modelOptions.models.forEach((model, idx) => {
     const card = document.createElement("button");
@@ -519,6 +536,8 @@ function renderModelPicker(data) {
       visionEnabled = e.target.checked;
       updateStorageInfo();
     };
+  } else {
+    document.getElementById("vision-box").style.display = "none";
   }
 
   updateStorageInfo();
