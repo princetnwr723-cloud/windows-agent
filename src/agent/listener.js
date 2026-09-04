@@ -51,17 +51,24 @@ function rtdbGet(rtdbUrl, path, apiKey) {
       let data = "";
       res.on("data", c => data += c);
       res.on("end", () => {
-        try {
-          const parsed = JSON.parse(data);
-          if (res.statusCode >= 400 || (parsed && parsed.error)) {
-            console.error(`❌ [RTDB GET] ${path} failed (status ${res.statusCode}):`, parsed?.error || data);
-            resolve(null); // treat as "no data" instead of pretending it succeeded
-            return;
-          }
-          resolve(parsed);
-        } catch {
-          resolve(null);
+        let parsed;
+        try { parsed = JSON.parse(data); } catch { parsed = undefined; }
+
+        // FIX: distinguish a real fetch FAILURE (network/permission
+        // error — REJECT, so callers know NOT to trust the result)
+        // from a genuinely EMPTY path (Firebase returns literal "null"
+        // with status 200 — this is the only case where resolve(null)
+        // means "confirmed nothing here"). Previously both cases
+        // resolved to null identically, which caused main.js to
+        // mistake "fetch failed" for "workspace doesn't exist" and
+        // wipe an existing connection by re-registering over it.
+        if (res.statusCode >= 400 || (parsed && typeof parsed === "object" && parsed.error)) {
+          const errMsg = parsed?.error || data || `HTTP ${res.statusCode}`;
+          console.error(`❌ [RTDB GET] ${path} FAILED (status ${res.statusCode}): ${errMsg}`);
+          reject(new Error(`RTDB GET ${path} failed: ${errMsg}`));
+          return;
         }
+        resolve(parsed === undefined ? null : parsed);
       });
     }).on("error", (err) => {
       console.error(`❌ [RTDB GET] ${path} network error:`, err.message);
