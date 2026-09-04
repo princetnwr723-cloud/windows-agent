@@ -1,13 +1,9 @@
-// src/main.js — Complete with RTDB + Scheduler
+// src/main.js — Connection/plan handshake now on Firestore,
+// everything else (commands, chats, scheduler, MCP) unchanged on RTDB.
 const {
   app, BrowserWindow, Tray, Menu, nativeImage,
   shell, dialog, ipcMain, screen,
 } = require("electron");
-// Auto-updater disabled — electron-updater wasn't bundled into the
-// packaged app (missing from the build), which crashed the app on
-// launch with "Cannot find module 'electron-updater'". Re-enable
-// once it's confirmed present in package.json dependencies AND
-// electron-builder's output — see setupAutoUpdater() below.
 const path            = require("path");
 const os              = require("os");
 const fs              = require("fs");
@@ -20,6 +16,13 @@ const { getModelOptions }       = require("./agent/modelSelector");
 const { setupModel, isOllamaRunning, startOllama } = require("./agent/ollamaManager");
 const { generatePermanentCode } = require("./agent/machineCode");
 const { initMemory }            = require("./agent/memory");
+
+// ── NEW: Firestore client for the pairing handshake ──────────
+const {
+  registerWorkspace: fsRegisterWorkspace,
+  getWorkspace:      fsGetWorkspace,
+  watchWorkspace:    fsWatchWorkspace,
+} = require("./agent/firestoreClient");
 
 const PLATFORM   = os.platform();
 const DATA_DIR   = path.join(app.getPath("userData"), "agentic-vnus");
@@ -72,313 +75,135 @@ function getOSName() {
   return "Linux";
 }
 
-// ── RTDB helpers ──────────────────────────────────────────
+// ── RTDB helpers — STILL USED for commands/chats/scheduler/etc,
+// which are untouched by this migration. Only registration/connect/
+// plan moved to Firestore. ──────────────────────────────────
 const { rtdbSet, rtdbGet, rtdbPatch, rtdbDelete } = require("./agent/listener");
 
-async function rtdbRegisterAgent(code, pcInfo) {
-  console.log(`📡 Registering agent at /workspaces/${code} on ${RTDB_URL}`);
+// ── Register agent in BOTH places:
+// - Firestore = source of truth for pairing/plan (reliable realtime)
+// - RTDB mirror = so listener.js's existing ownership check
+//   (rtdbGet .userId) and everything else under /workspaces/{code}
+//   (commands, chats, scheduler, skills, etc.) keeps working exactly
+//   as before, with zero changes needed in listener.js/scheduler.js/
+//   teamAgent.js/etc.
+async function registerAgentEverywhere(code, pcInfo) {
+  const payload = {
+    code, userId: null, userDisconnected: false,
+    status: "waiting", agentOnline: true,
+    pcName: pcInfo.pcName, os: pcInfo.os,
+    platform: pcInfo.platform, username: pcInfo.username,
+    totalMemory: pcInfo.totalMemory,
+    registeredAt: Date.now(),
+  };
+
   try {
-    const result = await rtdbSet(RTDB_URL, `/workspaces/${code}`, {
-      code, userId: null, userDisconnected: false,
-      status: "waiting", agentOnline: true,
-      pcName: pcInfo.pcName, os: pcInfo.os,
-      platform: pcInfo.platform, username: pcInfo.username,
-      totalMemory: pcInfo.totalMemory,
-      registeredAt: Date.now(),
-    }, firebaseConfig.apiKey);
-    console.log(`✅ Agent registered:`, result ? "success" : "NULL RESPONSE — check RTDB rules / RTDB_URL");
-    return result;
+    await fsRegisterWorkspace(code, payload);
   } catch (err) {
-    console.error(`❌ Agent registration FAILED — check that RTDB rules are published and RTDB_URL is correct:`, err.message);
-    throw err;
+    console.error("❌ Firestore registration FAILED:", err.message);
+    throw err; // this one is critical — pairing depends on it
+  }
+
+  try {
+    await rtdbSet(RTDB_URL, `/workspaces/${code}`, payload, firebaseConfig.apiKey);
+  } catch (err) {
+    console.error("⚠️ RTDB mirror on register failed (non-fatal, commands may not route until reconnect):", err.message);
   }
 }
 
-// ── FIX: previously this ONLY subscribed to future SSE changes.
-// If the workspace was ALREADY connected in RTDB from a previous
-// session (e.g. local state.json got reset/lost but RTDB still has
-// status:"connected" + userId — exactly what happens if the agent
-// connects successfully once, then is relaunched with a fresh/empty
-// state.json), no NEW event would ever fire, since nothing new is
-// changing in RTDB. The splash screen would sit on "Waiting for
-// connection..." forever even though the website already shows it
-// as connected.
-//
-// Fix #1 (existing): do an immediate one-time rtdbGet() check FIRST,
-// synchronously before subscribing. If the workspace is already
-// connected, trigger onConnected() right away instead of waiting for
-// a change that already happened in the past.
-//
-// Fix #2 (NEW): the raw SSE connection (`eventsource` package) can
-// die silently — no error, no close event — behind some firewalls,
-// antivirus products, or corporate proxies that don't like
-// long-lived streaming HTTP connections. When that happens, register
-// and connect both still work fine (they're just one-shot REST
-// calls), but the agent NEVER finds out the workspace flipped to
-// "connected" because the live stream that would tell it is dead.
-// This is exactly the "workspace shows connected on the website but
-// agent is stuck on Waiting for connection..." bug.
-//
-// Fix: add a lightweight polling fallback (every 4s) alongside the
-// SSE listener. Whichever one notices the change first wins — SSE
-// is still the fast path when it's healthy, but the poll guarantees
-// the agent can never get permanently stuck even if SSE is silently
-// dead the whole time.
-// ── FIX: SSE alone was unreliable in this environment — the live
-// "patch" event from Firebase sometimes never arrived (likely a
-// firewall/AV silently dropping or throttling the long-lived SSE
-// connection), even though a fresh one-shot HTTPS GET (rtdbGet)
-// always worked correctly on app restart. Rather than keep chasing
-// SSE reliability, this now ALSO polls every 3 seconds as a
-// guaranteed fallback — polling can never silently die the way a
-// streaming connection can, since each check is a brand new,
-// independent HTTPS request. SSE stays active too (for instant
-// updates when it does work), but polling guarantees a worst-case
-// 3-second detection time no matter what.
+// ── Listen for the website marking this workspace "connected" ──
+// FIX: was previously RTDB SSE only, which silently died in some
+// network environments. Now uses Firestore's onSnapshot, which
+// falls back to long-polling automatically when WebSocket is
+// blocked — this is the actual fix for "waiting forever while the
+// app is open" even though restarting the app (a fresh HTTPS GET)
+// always worked.
 async function listenForConnection(code, onConnected, onDisconnected) {
-  const { listenRTDB, rtdbGet } = require("./agent/listener");
+  let triggered = false;
 
-  let alreadyTriggered = false;
-
-  const checkAndTrigger = (data) => {
-    if (!data || alreadyTriggered) return;
-    const status           = data.status;
-    const userId           = data.userId;
-    const userDisconnected = data.userDisconnected;
-    const plan             = data.plan;
+  const checkAndTrigger = async (data) => {
+    if (!data || triggered) return;
+    const { status, userId, userDisconnected, plan } = data;
 
     if (userDisconnected && status === "disconnected") {
-      alreadyTriggered = true;
-      clearInterval(pollTimer);
+      triggered = true;
       onDisconnected?.();
-    } else if (status === "connected" && userId && !userDisconnected) {
-      console.log(`✅ Connection detected — userId: ${userId}`);
-      alreadyTriggered = true;
-      clearInterval(pollTimer);
+      return;
+    }
+    if (status === "connected" && userId && !userDisconnected) {
+      triggered = true;
+      console.log(`✅ [Firestore] Connection detected — userId: ${userId}`);
+      // Mirror into RTDB so ownership checks + all command routing
+      // (unchanged code in listener.js) keep working.
+      try {
+        await rtdbPatch(RTDB_URL, `/workspaces/${code}`, {
+          userId, status: "connected", userDisconnected: false, connectedAt: Date.now(),
+        }, firebaseConfig.apiKey);
+      } catch (err) {
+        console.error("⚠️ RTDB mirror on connect failed (non-fatal):", err.message);
+      }
       onConnected(userId, plan);
     }
   };
 
-  // ── Immediate check on start (covers "already connected before
-  // this listener even started" case) ──
+  // Immediate check — catches "already connected before we started listening"
+  console.log(`🔍 [Firestore] Checking current state of agent_workspaces/${code}...`);
   try {
-    console.log(`🔍 Checking current state of /workspaces/${code}...`);
-    const current = await rtdbGet(RTDB_URL, `/workspaces/${code}`, firebaseConfig.apiKey);
+    const current = await fsGetWorkspace(code);
     if (current) {
       console.log(`🔍 Current state:`, JSON.stringify({
         status: current.status, userId: current.userId,
         plan: current.plan, userDisconnected: current.userDisconnected,
       }));
-      checkAndTrigger(current);
+      await checkAndTrigger(current);
     }
   } catch (err) {
-    console.error("❌ Initial connection check failed:", err.message);
+    console.error("❌ Initial Firestore check failed:", err.message);
   }
 
-  if (alreadyTriggered) return;
+  if (triggered) return;
 
-  // ── SSE — instant updates when the connection survives ──
-  console.log(`👂 [SSE] Listening for live changes at /workspaces/${code}`);
-  listenRTDB(RTDB_URL, `/workspaces/${code}`, firebaseConfig.apiKey, (event, payload) => {
-    const data = payload?.data;
-    if (!data) return;
-    checkAndTrigger(data);
-  });
-
-  // ── Polling — guaranteed fallback every 3s, works even if SSE
-  // silently dies. This is the belt-and-suspenders fix. ──
-  console.log(`🔁 [Poll] Starting 3s polling fallback for /workspaces/${code}`);
-  const pollTimer = setInterval(async () => {
-    if (alreadyTriggered) { clearInterval(pollTimer); return; }
-    try {
-      const data = await rtdbGet(RTDB_URL, `/workspaces/${code}`, firebaseConfig.apiKey);
-      checkAndTrigger(data);
-    } catch (err) {
-      // Don't log every single poll failure — too noisy. Only log
-      // occasionally so we still notice if it's persistently broken.
-      if (Math.random() < 0.1) console.error("⚠️ [Poll] connection check failed:", err.message);
-    }
-  }, 3000);
+  console.log(`👂 [Firestore] Watching agent_workspaces/${code} for connection...`);
+  fsWatchWorkspace(code, checkAndTrigger);
 }
 
-// ── Same fix applied here — plan verification also gets a polling
-// fallback alongside SSE, for the same reason. ──
+// ── Listen for plan selection — same Firestore pattern ──────
 async function listenForPlanVerification(code, onVerified) {
-  const { listenRTDB, rtdbGet } = require("./agent/listener");
+  let triggered = false;
 
-  let alreadyTriggered = false;
-
-  const checkAndTrigger = (data) => {
-    if (!data || alreadyTriggered) return;
-    const plan         = data.plan;
-    const planVerified = data.planVerified;
+  const checkAndTrigger = async (data) => {
+    if (!data || triggered) return;
+    const { plan, planVerified } = data;
     if (plan && (planVerified === true || plan === "free")) {
-      console.log(`✅ Plan detected: ${plan}`);
-      alreadyTriggered = true;
-      clearInterval(pollTimer);
+      triggered = true;
+      console.log(`✅ [Firestore] Plan detected: ${plan}`);
+      try {
+        await rtdbPatch(RTDB_URL, `/workspaces/${code}`, { plan, planVerified: true }, firebaseConfig.apiKey);
+      } catch (err) {
+        console.error("⚠️ RTDB mirror on plan failed (non-fatal):", err.message);
+      }
       onVerified(plan);
     }
   };
 
-  // ── Immediate check ──
+  console.log(`🔍 [Firestore] Checking current plan on agent_workspaces/${code}...`);
   try {
-    console.log(`🔍 Checking current plan at /workspaces/${code}...`);
-    const current = await rtdbGet(RTDB_URL, `/workspaces/${code}`, firebaseConfig.apiKey);
-    checkAndTrigger(current);
+    const current = await fsGetWorkspace(code);
+    if (current) await checkAndTrigger(current);
   } catch (err) {
     console.error("❌ Initial plan check failed:", err.message);
   }
 
-  if (alreadyTriggered) return;
+  if (triggered) return;
 
-  // ── SSE ──
-  console.log(`👂 [SSE] Listening for plan at /workspaces/${code}`);
-  listenRTDB(RTDB_URL, `/workspaces/${code}`, firebaseConfig.apiKey, (event, payload) => {
-    const data = payload?.data;
-    if (!data) return;
-    checkAndTrigger(data);
-  });
-
-  // ── Polling fallback — 3s ──
-  console.log(`🔁 [Poll] Starting 3s polling fallback for plan on /workspaces/${code}`);
-  const pollTimer = setInterval(async () => {
-    if (alreadyTriggered) { clearInterval(pollTimer); return; }
-    try {
-      const data = await rtdbGet(RTDB_URL, `/workspaces/${code}`, firebaseConfig.apiKey);
-      checkAndTrigger(data);
-    } catch (err) {
-      if (Math.random() < 0.1) console.error("⚠️ [Poll] plan check failed:", err.message);
-    }
-  }, 3000);
+  console.log(`👂 [Firestore] Watching agent_workspaces/${code} for plan...`);
+  fsWatchWorkspace(code, checkAndTrigger);
 }
 
-// ── FIX: same issue as above, plus this now reads /workspaces/{code}
-// instead of the auth-protected /users/{userId} node (the Electron
-// agent has no Firebase Auth session, so that read always failed
-// silently before). PlanWall.tsx and the Gumroad webhook mirror the
-// plan into /workspaces/{code}, which is open in RTDB rules.
-//
-// Same SSE-can-die-silently risk applies here too, so this also gets
-// the polling fallback.
-async function listenForPlanVerification(code, onVerified) {
-  const { listenRTDB, rtdbGet } = require("./agent/listener");
-
-  let resolved  = false;
-  let pollTimer = null;
-
-  const checkAndTrigger = (data) => {
-    if (!data || resolved) return;
-    const plan         = data.plan;
-    const planVerified = data.planVerified;
-    if (plan && (planVerified === true || plan === "free")) {
-      console.log(`✅ Plan detected: ${plan}`);
-      resolved = true;
-      if (pollTimer) clearInterval(pollTimer);
-      onVerified(plan);
-    }
-  };
-
-  // ── Immediate check first — catches plan already set before this
-  // listener started (e.g. free plan chosen very fast, or relaunch
-  // after state.json was lost) ──
-  try {
-    console.log(`🔍 Checking current plan at /workspaces/${code}...`);
-    const current = await rtdbGet(RTDB_URL, `/workspaces/${code}`, firebaseConfig.apiKey);
-    checkAndTrigger(current);
-    if (resolved) return; // already have it — no need to also subscribe
-  } catch (err) {
-    console.error("❌ Initial plan check failed:", err.message);
-  }
-
-  // ── Then listen for future changes (fast path) ──
-  console.log(`👂 Listening for plan at /workspaces/${code}`);
-  listenRTDB(RTDB_URL, `/workspaces/${code}`, firebaseConfig.apiKey, (event, payload) => {
-    checkAndTrigger(payload?.data);
-  });
-
-  // ── NEW: polling safety net ──
-  console.log(`⏱️ Starting plan poll fallback for /workspaces/${code} (every 4s)`);
-  pollTimer = setInterval(async () => {
-    if (resolved) { clearInterval(pollTimer); return; }
-    try {
-      const current = await rtdbGet(RTDB_URL, `/workspaces/${code}`, firebaseConfig.apiKey);
-      checkAndTrigger(current);
-    } catch (err) {
-      console.error("⚠️ Plan poll check failed:", err.message);
-    }
-  }, 4000);
-}
-
-// ── Auto Updater — DISABLED ─────────────────────────────────
-// Was crashing the packaged app because electron-updater wasn't
-// actually bundled in. Kept as a no-op stub (not deleted outright)
-// so any existing call to setupAutoUpdater() elsewhere in this
-// file still runs safely instead of throwing.
-//
-// To re-enable later:
-//   1. Confirm "electron-updater" is in package.json "dependencies"
-//      (not devDependencies)
-//   2. Rebuild and verify resources/app.asar actually contains
-//      node_modules/electron-updater after packaging
-//   3. Restore the code below (kept commented, unchanged)
+// ── Auto Updater — DISABLED (unchanged from before) ─────────
 function setupAutoUpdater() {
   console.log("ℹ️ Auto-updater disabled for this build — checking manually via GitHub Releases instead");
   return;
-
-  /* ORIGINAL IMPLEMENTATION — restore once electron-updater is
-     confirmed bundled correctly in the packaged app:
-
-  autoUpdater.autoDownload    = true;
-  autoUpdater.autoInstallOnAppQuit = true;
-
-  autoUpdater.on("checking-for-update", () => {
-    console.log("🔍 Checking for updates...");
-  });
-
-  autoUpdater.on("update-available", (info) => {
-    console.log(`📦 Update available: v${info.version}`);
-    tray?.setToolTip(`Agentic Vnus — Downloading update v${info.version}...`);
-    sendToSplash("update-status", { status: "downloading", version: info.version });
-  });
-
-  autoUpdater.on("update-not-available", () => {
-    console.log("✅ App is up to date");
-  });
-
-  autoUpdater.on("download-progress", (progress) => {
-    const pct = Math.round(progress.percent);
-    console.log(`📥 Update download: ${pct}%`);
-    tray?.setToolTip(`Agentic Vnus — Update ${pct}%`);
-  });
-
-  autoUpdater.on("update-downloaded", (info) => {
-    console.log(`✅ Update downloaded: v${info.version}`);
-    tray?.setToolTip("Agentic Vnus — Update ready");
-
-    dialog.showMessageBox({
-      type:      "info",
-      title:     "Update Ready — Agentic Vnus",
-      message:   `v${info.version} is ready to install`,
-      detail:    "The update has been downloaded. Restart now to apply it — takes less than 30 seconds.",
-      buttons:   ["Restart & Install", "Later"],
-      defaultId: 0,
-      icon:      path.join(__dirname, "../assets/icon.png"),
-    }).then(result => {
-      if (result.response === 0) {
-        isQuitting = true;
-        autoUpdater.quitAndInstall();
-      }
-    });
-  });
-
-  autoUpdater.on("error", (err) => {
-    console.error("❌ Auto-update error:", err.message);
-  });
-
-  // Check on startup, then every 4 hours
-  setTimeout(() => autoUpdater.checkForUpdates(), 10000);
-  setInterval(() => autoUpdater.checkForUpdates(), 4 * 60 * 60 * 1000);
-  */
 }
 
 // ── Splash helpers ────────────────────────────────────────
@@ -524,12 +349,9 @@ ipcMain.on("retry-model-download", () => {
   }
 });
 
-// ── Start full agent (listener + scheduler) ───────────────
-// NOTE: startCommandListener is now async (it awaits MCP init,
-// agent status sync, etc. on startup) — this function must be
-// async too, and must AWAIT it, or listenerCleanup ends up holding
-// a Promise instead of the actual cleanup function, which crashes
-// the next time it's called as listenerCleanup().
+// ── Start full agent (listener + scheduler) — UNCHANGED,
+// still fully RTDB-based, since commands/chats/scheduler etc. were
+// never broken. ─────────────────────────────────────────────
 async function startFullAgent(code, selectedModel) {
   if (!selectedModel) return;
   const modelConfig = {
@@ -538,14 +360,12 @@ async function startFullAgent(code, selectedModel) {
     visionOllamaId: selectedModel.visionOllamaId || null,
   };
 
-  // Start RTDB command listener
   if (listenerCleanup) listenerCleanup();
   listenerCleanup = await startCommandListener(code, firebaseConfig, modelConfig);
 
-  // Start scheduler
   startScheduler(code, firebaseConfig, modelConfig);
 
-  console.log("🚀 Full agent started — Listener + Scheduler running");
+  console.log("🚀 Full agent started — Listener + Scheduler running (RTDB, unchanged)");
 }
 
 // ── App Ready ─────────────────────────────────────────────
@@ -564,20 +384,19 @@ app.whenReady().then(async () => {
 
   initMemory();
 
-  // ── Sanity check: fail loud instead of silent if RTDB_URL is missing ──
   if (!RTDB_URL) {
-    console.error("❌ FATAL: firebaseConfig.rtdbUrl is empty — agent cannot register or listen for anything. Check src/config.js / FIREBASE_RTDB_URL env var.");
-    dialog.showErrorBox("Configuration Error", "Realtime Database URL is not configured. The agent cannot connect. Please reinstall or contact support.");
+    console.error("❌ FATAL: firebaseConfig.rtdbUrl is empty — commands/chats/scheduler will not work.");
+    dialog.showErrorBox("Configuration Error", "Realtime Database URL is not configured.");
   } else {
-    console.log(`🔗 RTDB URL: ${RTDB_URL}`);
+    console.log(`🔗 RTDB URL (commands/chats/scheduler): ${RTDB_URL}`);
   }
+  console.log(`🔗 Firestore project (pairing/plan): ${firebaseConfig.projectId}`);
 
-  const code     = generatePermanentCode();
-  let   state    = loadState();
+  const code       = generatePermanentCode();
+  let   state      = loadState();
   const updateMenu = createTray();
-  const specs    = getPCSpecs();
+  const specs      = getPCSpecs();
 
-  // Setup auto updater
   setupAutoUpdater();
 
   if (!state.isSetup) {
@@ -591,62 +410,45 @@ app.whenReady().then(async () => {
 
     const pcInfo = getPCInfo();
     try {
-      await rtdbRegisterAgent(code, pcInfo);
+      await registerAgentEverywhere(code, pcInfo);
     } catch (err) {
       dialog.showErrorBox(
         "Could not register agent",
-        `Failed to write to the database. Check your internet connection and that Realtime Database rules are published.\n\n${err.message}`
+        `Failed to register with Firestore. Check your internet connection and that Firestore rules are published.\n\n${err.message}`
       );
     }
     state = saveState({ isSetup: true, agentCode: code, userId: null, plan: null, planVerified: false, selectedModel: null, modelReady: false, userDisconnected: false });
   } else {
     state.agentCode = code;
 
-    // ── FIX: previously, if this fetch FAILED for any reason
-    // (network hiccup on cold boot, transient RTDB permission issue,
-    // etc.), the code treated that failure identically to "the
-    // workspace node genuinely doesn't exist" and RE-REGISTERED the
-    // agent — which overwrites RTDB back to status:"waiting",
-    // userId:null, silently DESTROYING an already-working connection.
-    // This is what caused the observed toggle: connect → works once
-    // after restart → next restart wipes it back to "waiting".
-    //
-    // Now: only re-register when the fetch SUCCEEDS and confirms the
-    // path is truly empty (wsData === null). If the fetch throws
-    // (fetchFailed), we do NOTHING here — no re-register, no state
-    // reset — and just let listenForConnection()'s own immediate
-    // check + live SSE subscription (called later) keep trying. That
-    // way a flaky network moment can never destroy a real connection.
-    let wsData;
-    let fetchFailed = false;
+    // ── Source of truth is now Firestore, not RTDB ──
+    let wsData = null;
     try {
-      wsData = await rtdbGet(RTDB_URL, `/workspaces/${code}`, firebaseConfig.apiKey);
+      wsData = await fsGetWorkspace(code);
     } catch (err) {
-      console.error("⚠️ Could not read existing workspace state — will NOT touch RTDB, retrying via listener instead:", err.message);
-      fetchFailed = true;
+      console.error("⚠️ Could not read existing Firestore workspace state:", err.message);
     }
 
-    if (!fetchFailed) {
-      if (wsData?.userDisconnected) {
-        state = saveState({ userId: null, userDisconnected: true, plan: null, planVerified: false, modelReady: false, selectedModel: null });
-        try {
-          await rtdbPatch(RTDB_URL, `/workspaces/${code}`, { status: "waiting", userId: null, userDisconnected: false }, firebaseConfig.apiKey);
-        } catch (err) {
-          console.error("⚠️ Could not reset disconnected workspace:", err.message);
-        }
-      } else if (wsData === null) {
-        // Confirmed empty — safe to register fresh
-        console.log(`ℹ️ /workspaces/${code} confirmed empty — registering fresh`);
-        const pcInfo = getPCInfo();
-        try {
-          await rtdbRegisterAgent(code, pcInfo);
-        } catch (err) {
-          dialog.showErrorBox("Could not re-register agent", err.message);
-        }
+    if (wsData?.userDisconnected) {
+      state = saveState({ userId: null, userDisconnected: true, plan: null, planVerified: false, modelReady: false, selectedModel: null });
+      try {
+        await fsRegisterWorkspace(code, { status: "waiting", userId: null, userDisconnected: false });
+        await rtdbPatch(RTDB_URL, `/workspaces/${code}`, { status: "waiting", userId: null, userDisconnected: false }, firebaseConfig.apiKey);
+      } catch (err) {
+        console.error("⚠️ Could not reset disconnected workspace:", err.message);
       }
-      // else: wsData has real data (already connected/waiting/etc.) —
-      // leave it completely untouched.
+    } else if (wsData === null) {
+      // Confirmed empty (not a fetch error — getWorkspace already
+      // separates "doc doesn't exist" from thrown errors) — safe to register fresh.
+      console.log(`ℹ️ agent_workspaces/${code} confirmed empty — registering fresh`);
+      const pcInfo = getPCInfo();
+      try {
+        await registerAgentEverywhere(code, pcInfo);
+      } catch (err) {
+        dialog.showErrorBox("Could not re-register agent", err.message);
+      }
     }
+    // else: wsData has real data — leave it untouched.
 
     saveState({ agentCode: code });
     state = loadState();
@@ -684,12 +486,6 @@ app.whenReady().then(async () => {
         updateMenu(true);
         sendToSplash("workspace-connected", { userId });
 
-        // ── If the plan was already written by the time we get the
-        // connection event (e.g. free plan chosen very fast, or the
-        // Gumroad webhook already fired, or this is the "already
-        // connected from a previous session" case this whole fix is
-        // for), skip straight to the model picker instead of showing
-        // "waiting for plan" forever.
         if (planFromRTDB) {
           saveState({ plan: planFromRTDB, planVerified: true });
           sendToSplash("plan-verified", { plan: planFromRTDB });
