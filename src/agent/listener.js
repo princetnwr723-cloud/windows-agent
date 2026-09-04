@@ -1,5 +1,7 @@
 // src/agent/listener.js
-// ✅ Firebase Realtime Database WebSocket — zero polling (original)
+// ✅ Firebase Realtime Database — now using battle-tested `eventsource`
+//    library instead of a hand-rolled raw HTTPS SSE parser, which
+//    could silently drop/miss events with no error surfaced.
 // ✅ Rate limiting + ownership verification (original)
 // ✅ Skills sync to RTDB (original)
 // ✅ Screenshot listener (original)
@@ -22,6 +24,7 @@ const { startTelegramBot, notify, loadTGConfig, saveBotToken, testBotToken, save
 const { chatWithAgent, executeTeamTask, getAllAgentStatuses, getRecentLog, addToLog } = require("./teamAgent");
 const https                                = require("https");
 const http                                 = require("http");
+const EventSource                          = require("eventsource"); // ← NEW
 
 const MAX_PER_MIN = 20;
 const rateLimiter = new Map();
@@ -89,45 +92,70 @@ function rtdbDelete(rtdbUrl, path, apiKey) {
   });
 }
 
-// ── Firebase RTDB SSE listener (original) ─────────────────
+// ── Firebase RTDB SSE listener — REWRITTEN ────────────────
+// FIX: the old version hand-parsed raw HTTPS chunks looking for
+// "event: " / "data: " lines. This is fragile — Firebase sends
+// periodic keep-alive comments and can chunk data across TCP
+// packets in ways that silently broke the buffer-splitting logic,
+// with ZERO error ever surfaced. Symptom: agent sits on "Waiting
+// for connection..." forever even though RTDB data is correct and
+// rules are fine, because events just never arrived at the parser.
+//
+// Now uses the `eventsource` npm package (npm install eventsource),
+// which is the standard, battle-tested SSE client used by Firebase's
+// own tooling. It handles keep-alives, chunking, and reconnection
+// correctly, and logs real errors instead of failing silently.
 function listenRTDB(rtdbUrl, path, apiKey, onData) {
-  const url     = `${rtdbUrl}${path}.json?auth=${apiKey}`;
-  const urlObj  = new URL(url);
-  const options = {
-    hostname: urlObj.hostname,
-    path:     urlObj.pathname + urlObj.search,
-    method:   "GET",
-    headers:  { "Accept":"text/event-stream", "Cache-Control":"no-cache" },
-  };
-  const mod = urlObj.protocol === "https:" ? https : http;
-  let retry = 1000;
+  const url = `${rtdbUrl}${path}.json?auth=${apiKey}`;
+  console.log(`📡 [SSE] Connecting: ${path}`);
+
+  let es;
+  let closed = false;
 
   function connect() {
-    const req = mod.request(options, (res) => {
-      retry = 1000;
-      let buffer = "";
-      res.on("data", (chunk) => {
-        buffer += chunk.toString();
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
-        let event = null, dataStr = "";
-        for (const line of lines) {
-          if (line.startsWith("event: "))      event   = line.slice(7).trim();
-          else if (line.startsWith("data: "))  dataStr = line.slice(6).trim();
-          else if (line === "" && event && dataStr) {
-            try { const parsed = JSON.parse(dataStr); onData(event, parsed); } catch {}
-            event = null; dataStr = "";
-          }
-        }
-      });
-      res.on("end", () => { console.warn("⚠️ RTDB closed — reconnecting..."); setTimeout(connect, retry); retry = Math.min(retry*2, 30000); });
-      res.on("error", () => { setTimeout(connect, retry); retry = Math.min(retry*2, 30000); });
+    es = new EventSource(url, { headers: { "Accept": "text/event-stream" } });
+
+    es.addEventListener("put", (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        console.log(`📥 [SSE put] ${path}`);
+        onData("put", data);
+      } catch (err) {
+        console.error(`❌ [SSE] put parse error on ${path}:`, err.message);
+      }
     });
-    req.on("error", () => { setTimeout(connect, retry); retry = Math.min(retry*2, 30000); });
-    req.end();
+
+    es.addEventListener("patch", (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        console.log(`📥 [SSE patch] ${path}`);
+        onData("patch", data);
+      } catch (err) {
+        console.error(`❌ [SSE] patch parse error on ${path}:`, err.message);
+      }
+    });
+
+    es.addEventListener("auth_revoked", () => {
+      console.warn(`⚠️ [SSE] auth revoked on ${path} — reconnecting`);
+      es.close();
+      if (!closed) setTimeout(connect, 1000);
+    });
+
+    es.onopen = () => {
+      console.log(`✅ [SSE] connected: ${path}`);
+    };
+
+    es.onerror = (err) => {
+      console.error(`⚠️ [SSE] error on ${path}:`, err?.message || err?.type || "unknown", "— reconnecting in 2s");
+      es.close();
+      if (!closed) setTimeout(connect, 2000);
+    };
   }
 
   connect();
+
+  // Return a cleanup function so callers CAN close it if ever needed
+  return () => { closed = true; es?.close(); };
 }
 
 // ── Update message in RTDB (original) ────────────────────
@@ -269,7 +297,7 @@ async function startCommandListener(workspaceId, firebaseConfig, modelConfig) {
     return null;
   }
 
-  console.log(`\n✅ RTDB Listener started (WebSocket — zero polling)`);
+  console.log(`\n✅ RTDB Listener started (SSE via eventsource — zero polling)`);
   console.log(`   Workspace : ${workspaceId}`);
   console.log(`   Model     : ${modelConfig.ollamaId}`);
   console.log(`   Vision    : ${modelConfig.visionEnabled ? "ON" : "OFF"}`);
