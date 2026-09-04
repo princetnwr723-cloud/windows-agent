@@ -94,16 +94,29 @@ async function rtdbRegisterAgent(code, pcInfo) {
   }
 }
 
+// ── FIX: previously this ONLY subscribed to future SSE changes.
+// If the workspace was ALREADY connected in RTDB from a previous
+// session (e.g. local state.json got reset/lost but RTDB still has
+// status:"connected" + userId — exactly what happens if the agent
+// connects successfully once, then is relaunched with a fresh/empty
+// state.json), no NEW event would ever fire, since nothing new is
+// changing in RTDB. The splash screen would sit on "Waiting for
+// connection..." forever even though the website already shows it
+// as connected.
+//
+// Fix: do an immediate one-time rtdbGet() check FIRST, synchronously
+// before subscribing. If the workspace is already connected, trigger
+// onConnected() right away instead of waiting for a change that
+// already happened in the past.
 async function listenForConnection(code, onConnected, onDisconnected) {
-  const { listenRTDB } = require("./agent/listener");
-  console.log(`👂 Listening for connection at /workspaces/${code}`);
-  listenRTDB(RTDB_URL, `/workspaces/${code}`, firebaseConfig.apiKey, (event, payload) => {
-    const data = payload?.data;
+  const { listenRTDB, rtdbGet } = require("./agent/listener");
+
+  const checkAndTrigger = (data) => {
     if (!data) return;
-    const status          = data.status;
-    const userId          = data.userId;
+    const status           = data.status;
+    const userId           = data.userId;
     const userDisconnected = data.userDisconnected;
-    const plan            = data.plan;
+    const plan             = data.plan;
 
     if (userDisconnected && status === "disconnected") {
       onDisconnected?.();
@@ -111,21 +124,61 @@ async function listenForConnection(code, onConnected, onDisconnected) {
       console.log(`✅ Connection detected — userId: ${userId}`);
       onConnected(userId, plan);
     }
+  };
+
+  // ── Immediate check — catches the case where connection already
+  // happened before this listener started ──
+  try {
+    console.log(`🔍 Checking current state of /workspaces/${code}...`);
+    const current = await rtdbGet(RTDB_URL, `/workspaces/${code}`, firebaseConfig.apiKey);
+    if (current) {
+      console.log(`🔍 Current state:`, JSON.stringify({
+        status: current.status,
+        userId: current.userId,
+        plan: current.plan,
+        userDisconnected: current.userDisconnected,
+      }));
+      checkAndTrigger(current);
+    } else {
+      console.log(`🔍 No existing data at /workspaces/${code}`);
+    }
+  } catch (err) {
+    console.error("❌ Initial connection check failed:", err.message);
+  }
+
+  // ── Then keep listening for any FUTURE changes too ──
+  console.log(`👂 Listening for live changes at /workspaces/${code}`);
+  listenRTDB(RTDB_URL, `/workspaces/${code}`, firebaseConfig.apiKey, (event, payload) => {
+    const data = payload?.data;
+    if (!data) return;
+    checkAndTrigger(data);
   });
 }
 
-// ── FIX: previously listened on /users/{userId}, which requires
-// Firebase Auth (auth != null && auth.uid == $userId in RTDB rules).
-// The Electron agent has NO Firebase Auth session — it only makes
-// raw REST calls with the public web API key, never a real ID
-// token — so that read ALWAYS failed silently (PERMISSION_DENIED),
-// and the model picker screen never appeared after choosing a plan.
-//
-// Now listens on /workspaces/{code} instead, which is fully open
-// in RTDB rules (".read": true, ".write": true) and is where
-// PlanWall.tsx + the Gumroad webhook now mirror the plan to.
+// ── FIX: same issue as above, plus this now reads /workspaces/{code}
+// instead of the auth-protected /users/{userId} node (the Electron
+// agent has no Firebase Auth session, so that read always failed
+// silently before). PlanWall.tsx and the Gumroad webhook mirror the
+// plan into /workspaces/{code}, which is open in RTDB rules.
 async function listenForPlanVerification(code, onVerified) {
-  const { listenRTDB } = require("./agent/listener");
+  const { listenRTDB, rtdbGet } = require("./agent/listener");
+
+  // ── Immediate check first — catches plan already set before this
+  // listener started (e.g. free plan chosen very fast, or relaunch
+  // after state.json was lost) ──
+  try {
+    console.log(`🔍 Checking current plan at /workspaces/${code}...`);
+    const current = await rtdbGet(RTDB_URL, `/workspaces/${code}`, firebaseConfig.apiKey);
+    if (current?.plan && (current.planVerified === true || current.plan === "free")) {
+      console.log(`✅ Plan already set: ${current.plan}`);
+      onVerified(current.plan);
+      return; // already have it — no need to also subscribe
+    }
+  } catch (err) {
+    console.error("❌ Initial plan check failed:", err.message);
+  }
+
+  // ── Then listen for future changes ──
   console.log(`👂 Listening for plan at /workspaces/${code}`);
   listenRTDB(RTDB_URL, `/workspaces/${code}`, firebaseConfig.apiKey, (event, payload) => {
     const data = payload?.data;
@@ -133,7 +186,7 @@ async function listenForPlanVerification(code, onVerified) {
     const plan         = data.plan;
     const planVerified = data.planVerified;
     if (plan && (planVerified === true || plan === "free")) {
-      console.log(`✅ Plan detected: ${plan}`);
+      console.log(`✅ Plan detected via listener: ${plan}`);
       onVerified(plan);
     }
   });
@@ -487,11 +540,12 @@ app.whenReady().then(async () => {
         updateMenu(true);
         sendToSplash("workspace-connected", { userId });
 
-        // ── FIX: if the plan was already written by the time we
-        // get the connection event (race condition — e.g. free plan
-        // chosen very fast, or webhook already fired), skip straight
-        // to the model picker instead of showing "waiting for plan"
-        // forever.
+        // ── If the plan was already written by the time we get the
+        // connection event (e.g. free plan chosen very fast, or the
+        // Gumroad webhook already fired, or this is the "already
+        // connected from a previous session" case this whole fix is
+        // for), skip straight to the model picker instead of showing
+        // "waiting for plan" forever.
         if (planFromRTDB) {
           saveState({ plan: planFromRTDB, planVerified: true });
           sendToSplash("plan-verified", { plan: planFromRTDB });
@@ -501,12 +555,6 @@ app.whenReady().then(async () => {
 
         sendToSplash("waiting-for-plan", { message: "Waiting for plan selection..." });
 
-        // ── FIX: was listenForPlanVerification(userId, ...) reading
-        // the auth-protected /users/{userId} node — the agent has no
-        // Firebase Auth session so that always failed silently.
-        // Now listens on /workspaces/{code} (open in RTDB rules),
-        // which PlanWall.tsx and the Gumroad webhook mirror the plan
-        // into.
         listenForPlanVerification(code, async (plan) => {
           saveState({ plan, planVerified: true });
           sendToSplash("plan-verified", { plan });
