@@ -124,73 +124,132 @@ async function rtdbRegisterAgent(code, pcInfo) {
 // is still the fast path when it's healthy, but the poll guarantees
 // the agent can never get permanently stuck even if SSE is silently
 // dead the whole time.
+// ── FIX: SSE alone was unreliable in this environment — the live
+// "patch" event from Firebase sometimes never arrived (likely a
+// firewall/AV silently dropping or throttling the long-lived SSE
+// connection), even though a fresh one-shot HTTPS GET (rtdbGet)
+// always worked correctly on app restart. Rather than keep chasing
+// SSE reliability, this now ALSO polls every 3 seconds as a
+// guaranteed fallback — polling can never silently die the way a
+// streaming connection can, since each check is a brand new,
+// independent HTTPS request. SSE stays active too (for instant
+// updates when it does work), but polling guarantees a worst-case
+// 3-second detection time no matter what.
 async function listenForConnection(code, onConnected, onDisconnected) {
   const { listenRTDB, rtdbGet } = require("./agent/listener");
 
-  let resolved  = false;
-  let pollTimer = null;
+  let alreadyTriggered = false;
 
   const checkAndTrigger = (data) => {
-    if (!data || resolved) return;
+    if (!data || alreadyTriggered) return;
     const status           = data.status;
     const userId           = data.userId;
     const userDisconnected = data.userDisconnected;
     const plan             = data.plan;
 
     if (userDisconnected && status === "disconnected") {
-      resolved = true;
-      if (pollTimer) clearInterval(pollTimer);
+      alreadyTriggered = true;
+      clearInterval(pollTimer);
       onDisconnected?.();
     } else if (status === "connected" && userId && !userDisconnected) {
       console.log(`✅ Connection detected — userId: ${userId}`);
-      resolved = true;
-      if (pollTimer) clearInterval(pollTimer);
+      alreadyTriggered = true;
+      clearInterval(pollTimer);
       onConnected(userId, plan);
     }
   };
 
-  // ── Immediate check — catches the case where connection already
-  // happened before this listener started ──
+  // ── Immediate check on start (covers "already connected before
+  // this listener even started" case) ──
   try {
     console.log(`🔍 Checking current state of /workspaces/${code}...`);
     const current = await rtdbGet(RTDB_URL, `/workspaces/${code}`, firebaseConfig.apiKey);
     if (current) {
       console.log(`🔍 Current state:`, JSON.stringify({
-        status: current.status,
-        userId: current.userId,
-        plan: current.plan,
-        userDisconnected: current.userDisconnected,
+        status: current.status, userId: current.userId,
+        plan: current.plan, userDisconnected: current.userDisconnected,
       }));
       checkAndTrigger(current);
-    } else {
-      console.log(`🔍 No existing data at /workspaces/${code}`);
     }
   } catch (err) {
     console.error("❌ Initial connection check failed:", err.message);
   }
 
-  if (resolved) return;
+  if (alreadyTriggered) return;
 
-  // ── Then keep listening for any FUTURE changes too (fast path) ──
-  console.log(`👂 Listening for live changes at /workspaces/${code}`);
+  // ── SSE — instant updates when the connection survives ──
+  console.log(`👂 [SSE] Listening for live changes at /workspaces/${code}`);
   listenRTDB(RTDB_URL, `/workspaces/${code}`, firebaseConfig.apiKey, (event, payload) => {
     const data = payload?.data;
     if (!data) return;
     checkAndTrigger(data);
   });
 
-  // ── NEW: polling safety net — guarantees detection even if the
-  // SSE stream above is silently dead (firewall/AV interference) ──
-  console.log(`⏱️ Starting connection poll fallback for /workspaces/${code} (every 4s)`);
-  pollTimer = setInterval(async () => {
-    if (resolved) { clearInterval(pollTimer); return; }
+  // ── Polling — guaranteed fallback every 3s, works even if SSE
+  // silently dies. This is the belt-and-suspenders fix. ──
+  console.log(`🔁 [Poll] Starting 3s polling fallback for /workspaces/${code}`);
+  const pollTimer = setInterval(async () => {
+    if (alreadyTriggered) { clearInterval(pollTimer); return; }
     try {
-      const current = await rtdbGet(RTDB_URL, `/workspaces/${code}`, firebaseConfig.apiKey);
-      checkAndTrigger(current);
+      const data = await rtdbGet(RTDB_URL, `/workspaces/${code}`, firebaseConfig.apiKey);
+      checkAndTrigger(data);
     } catch (err) {
-      console.error("⚠️ Connection poll check failed:", err.message);
+      // Don't log every single poll failure — too noisy. Only log
+      // occasionally so we still notice if it's persistently broken.
+      if (Math.random() < 0.1) console.error("⚠️ [Poll] connection check failed:", err.message);
     }
-  }, 4000);
+  }, 3000);
+}
+
+// ── Same fix applied here — plan verification also gets a polling
+// fallback alongside SSE, for the same reason. ──
+async function listenForPlanVerification(code, onVerified) {
+  const { listenRTDB, rtdbGet } = require("./agent/listener");
+
+  let alreadyTriggered = false;
+
+  const checkAndTrigger = (data) => {
+    if (!data || alreadyTriggered) return;
+    const plan         = data.plan;
+    const planVerified = data.planVerified;
+    if (plan && (planVerified === true || plan === "free")) {
+      console.log(`✅ Plan detected: ${plan}`);
+      alreadyTriggered = true;
+      clearInterval(pollTimer);
+      onVerified(plan);
+    }
+  };
+
+  // ── Immediate check ──
+  try {
+    console.log(`🔍 Checking current plan at /workspaces/${code}...`);
+    const current = await rtdbGet(RTDB_URL, `/workspaces/${code}`, firebaseConfig.apiKey);
+    checkAndTrigger(current);
+  } catch (err) {
+    console.error("❌ Initial plan check failed:", err.message);
+  }
+
+  if (alreadyTriggered) return;
+
+  // ── SSE ──
+  console.log(`👂 [SSE] Listening for plan at /workspaces/${code}`);
+  listenRTDB(RTDB_URL, `/workspaces/${code}`, firebaseConfig.apiKey, (event, payload) => {
+    const data = payload?.data;
+    if (!data) return;
+    checkAndTrigger(data);
+  });
+
+  // ── Polling fallback — 3s ──
+  console.log(`🔁 [Poll] Starting 3s polling fallback for plan on /workspaces/${code}`);
+  const pollTimer = setInterval(async () => {
+    if (alreadyTriggered) { clearInterval(pollTimer); return; }
+    try {
+      const data = await rtdbGet(RTDB_URL, `/workspaces/${code}`, firebaseConfig.apiKey);
+      checkAndTrigger(data);
+    } catch (err) {
+      if (Math.random() < 0.1) console.error("⚠️ [Poll] plan check failed:", err.message);
+    }
+  }, 3000);
 }
 
 // ── FIX: same issue as above, plus this now reads /workspaces/{code}
