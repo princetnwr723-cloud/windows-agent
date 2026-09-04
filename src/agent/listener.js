@@ -50,8 +50,23 @@ function rtdbGet(rtdbUrl, path, apiKey) {
     mod.get(url, (res) => {
       let data = "";
       res.on("data", c => data += c);
-      res.on("end", () => { try { resolve(JSON.parse(data)); } catch { resolve(null); } });
-    }).on("error", reject);
+      res.on("end", () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (res.statusCode >= 400 || (parsed && parsed.error)) {
+            console.error(`❌ [RTDB GET] ${path} failed (status ${res.statusCode}):`, parsed?.error || data);
+            resolve(null); // treat as "no data" instead of pretending it succeeded
+            return;
+          }
+          resolve(parsed);
+        } catch {
+          resolve(null);
+        }
+      });
+    }).on("error", (err) => {
+      console.error(`❌ [RTDB GET] ${path} network error:`, err.message);
+      reject(err);
+    });
   });
 }
 
@@ -69,9 +84,20 @@ function rtdbSet(rtdbUrl, path, data, apiKey, method = "PUT") {
     const req = mod.request(options, (res) => {
       let d = "";
       res.on("data", c => d += c);
-      res.on("end", () => resolve(JSON.parse(d || "null")));
+      res.on("end", () => {
+        const parsed = JSON.parse(d || "null");
+        if (res.statusCode >= 400 || (parsed && parsed.error)) {
+          console.error(`❌ [RTDB ${method}] ${path} failed (status ${res.statusCode}):`, parsed?.error || d);
+          resolve(null);
+          return;
+        }
+        resolve(parsed);
+      });
     });
-    req.on("error", reject);
+    req.on("error", (err) => {
+      console.error(`❌ [RTDB ${method}] ${path} network error:`, err.message);
+      reject(err);
+    });
     req.write(body);
     req.end();
   });
