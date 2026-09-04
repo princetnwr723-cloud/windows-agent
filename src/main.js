@@ -542,26 +542,53 @@ app.whenReady().then(async () => {
     state = saveState({ isSetup: true, agentCode: code, userId: null, plan: null, planVerified: false, selectedModel: null, modelReady: false, userDisconnected: false });
   } else {
     state.agentCode = code;
-    let wsData = null;
+
+    // ── FIX: previously, if this fetch FAILED for any reason
+    // (network hiccup on cold boot, transient RTDB permission issue,
+    // etc.), the code treated that failure identically to "the
+    // workspace node genuinely doesn't exist" and RE-REGISTERED the
+    // agent — which overwrites RTDB back to status:"waiting",
+    // userId:null, silently DESTROYING an already-working connection.
+    // This is what caused the observed toggle: connect → works once
+    // after restart → next restart wipes it back to "waiting".
+    //
+    // Now: only re-register when the fetch SUCCEEDS and confirms the
+    // path is truly empty (wsData === null). If the fetch throws
+    // (fetchFailed), we do NOTHING here — no re-register, no state
+    // reset — and just let listenForConnection()'s own immediate
+    // check + live SSE subscription (called later) keep trying. That
+    // way a flaky network moment can never destroy a real connection.
+    let wsData;
+    let fetchFailed = false;
     try {
       wsData = await rtdbGet(RTDB_URL, `/workspaces/${code}`, firebaseConfig.apiKey);
     } catch (err) {
-      console.error("❌ Could not read existing workspace state:", err.message);
+      console.error("⚠️ Could not read existing workspace state — will NOT touch RTDB, retrying via listener instead:", err.message);
+      fetchFailed = true;
     }
-    if (wsData?.userDisconnected) {
-      state = saveState({ userId: null, userDisconnected: true, plan: null, planVerified: false, modelReady: false, selectedModel: null });
-      await rtdbPatch(RTDB_URL, `/workspaces/${code}`, { status: "waiting", userId: null, userDisconnected: false }, firebaseConfig.apiKey);
-    }
-    if (!wsData) {
-      // Workspace node doesn't exist (e.g. DB was reset, or first
-      // registration silently failed before this fix) — re-register.
-      const pcInfo = getPCInfo();
-      try {
-        await rtdbRegisterAgent(code, pcInfo);
-      } catch (err) {
-        dialog.showErrorBox("Could not re-register agent", err.message);
+
+    if (!fetchFailed) {
+      if (wsData?.userDisconnected) {
+        state = saveState({ userId: null, userDisconnected: true, plan: null, planVerified: false, modelReady: false, selectedModel: null });
+        try {
+          await rtdbPatch(RTDB_URL, `/workspaces/${code}`, { status: "waiting", userId: null, userDisconnected: false }, firebaseConfig.apiKey);
+        } catch (err) {
+          console.error("⚠️ Could not reset disconnected workspace:", err.message);
+        }
+      } else if (wsData === null) {
+        // Confirmed empty — safe to register fresh
+        console.log(`ℹ️ /workspaces/${code} confirmed empty — registering fresh`);
+        const pcInfo = getPCInfo();
+        try {
+          await rtdbRegisterAgent(code, pcInfo);
+        } catch (err) {
+          dialog.showErrorBox("Could not re-register agent", err.message);
+        }
       }
+      // else: wsData has real data (already connected/waiting/etc.) —
+      // leave it completely untouched.
     }
+
     saveState({ agentCode: code });
     state = loadState();
   }
